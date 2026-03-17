@@ -19,7 +19,7 @@ FastAPI + PyMuPDF Backend für die PDF-Tiefenanalyse.
 
 ---
 
-## Lokaler Start (Entwicklung)
+## Lokaler Start (Entwicklung) 
 
 ```bash
 # 1. Python-Umgebung
