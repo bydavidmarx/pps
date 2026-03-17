@@ -355,7 +355,8 @@ def analyze_images(page, doc, print_w_mm, print_h_mm, scale):
                     dpi_x = img_w_px / (placed_w_mm / 25.4)
                     dpi_y = img_h_px / (placed_h_mm / 25.4)
                     dpi_effective = min(dpi_x, dpi_y)
-                    dpi_at_1to1 = dpi_effective * scale
+                    # Bei 1:10: 300 DPI im Dokument = 30 DPI im Druck (1:1)
+                    dpi_at_1to1 = dpi_effective / scale
                 else:
                     dpi_effective = 0
                     dpi_at_1to1 = 0
@@ -364,7 +365,7 @@ def analyze_images(page, doc, print_w_mm, print_h_mm, scale):
                 page_w_mm = page.rect.width * PT_TO_MM
                 page_h_mm = page.rect.height * PT_TO_MM
                 dpi_effective = min(img_w_px / (page_w_mm / 25.4), img_h_px / (page_h_mm / 25.4))
-                dpi_at_1to1 = dpi_effective * scale
+                dpi_at_1to1 = dpi_effective / scale
 
             images.append({
                 "xref": xref,
@@ -391,24 +392,33 @@ def evaluate_images(images, min_dpi, critical_dpi, scale):
     if not valid:
         return ("warn", f"{len(images)} Bild(er) — DPI nicht messbar", "Auflösung konnte nicht bestimmt werden.")
 
-    min_found  = min(i["dpi_in_doc"] for i in valid)
-    max_found  = max(i["dpi_in_doc"] for i in valid)
-    below_min  = [i for i in valid if i["dpi_in_doc"] < min_dpi]
-    below_crit = [i for i in valid if i["dpi_in_doc"] < critical_dpi]
+    # dpi_at_1to1 ist die echte Druckauflösung (dpi_in_doc / scale)
+    min_at_1to1 = min(i["dpi_at_1to1"] for i in valid)
+    max_at_1to1 = max(i["dpi_at_1to1"] for i in valid)
+    min_in_doc  = min(i["dpi_in_doc"]  for i in valid)
+    max_in_doc  = max(i["dpi_in_doc"]  for i in valid)
 
-    value = f"{len(images)} Bild(er) · {min_found:.1f}–{max_found:.1f} DPI im Dokument (= {min_found*scale:.0f}–{max_found*scale:.0f} DPI bei 1:1)"
+    min_print = 50.0   # Minimum DPI bei 1:1
+    crit_print = 25.0  # Kritisch — zu niedrig für Upscaling
+
+    below_min  = [i for i in valid if i["dpi_at_1to1"] < min_print]
+    below_crit = [i for i in valid if i["dpi_at_1to1"] < crit_print]
+
+    value = (f"{len(images)} Bild(er) · "
+             f"{min_in_doc:.0f}–{max_in_doc:.0f} DPI im Dokument "
+             f"(= {min_at_1to1:.0f}–{max_at_1to1:.0f} DPI bei 1:1)")
 
     if below_crit:
         return ("error", value,
-                f"{len(below_crit)} Bild(er) unter {critical_dpi:.1f} DPI ({critical_dpi*scale:.0f} DPI bei 1:1). "
+                f"{len(below_crit)} Bild(er) unter {crit_print:.0f} DPI (1:1). "
                 f"Zu niedrig für Upscaling — bitte Originaldatei in höherer Auflösung liefern.")
     elif below_min:
         return ("warn", value,
-                f"{len(below_min)} Bild(er) unter {min_dpi:.1f} DPI (Minimum {min_dpi*scale:.0f} DPI bei 1:1). "
+                f"{len(below_min)} Bild(er) unter {min_print:.0f} DPI (1:1). "
                 f"Upscaling (2×) über 'Fix It' möglich.")
     else:
         return ("ok", value,
-                f"Alle Bilder erreichen mindestens {min_dpi:.1f} DPI ({min_dpi*scale:.0f} DPI bei 1:1). Auflösung ausreichend.")
+                f"Alle Bilder erreichen mindestens {min_print:.0f} DPI bei 1:1. Auflösung ausreichend.")
 
 
 # ─────────────────────────────────────────────
@@ -530,24 +540,57 @@ def analyze_colorspace(page, doc, raw_bytes):
 #  CROP MARK DETECTION
 # ─────────────────────────────────────────────
 def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
-    # If TrimBox is smaller than MediaBox, cropmarks likely exist outside
-    if media_w > trim_w + 3 or media_h > trim_h + 3:
-        # Check for vector strokes in the margin area
-        paths = page.get_drawings()
-        margin = (media_w - trim_w) / 2
-        for p in paths:
-            r = p.get("rect")
-            if r is None:
-                continue
-            x0_mm = r.x0 * PT_TO_MM
-            y0_mm = r.y0 * PT_TO_MM
-            # If strokes are in outer margin = likely cropmarks
-            if x0_mm < margin * 0.8 or y0_mm < margin * 0.8:
-                return True
-    # Fallback: count total strokes
+    """
+    Beschnittzeichen erkennen — nur wenn Elemente AUSSERHALB der TrimBox liegen.
+    Vektorgrafiken innerhalb der TrimBox werden nicht als Beschnittzeichen gewertet.
+    """
+    # Nur prüfen wenn MediaBox größer als TrimBox ist (Beschnitt vorhanden)
+    margin_w = (media_w - trim_w) / 2
+    margin_h = (media_h - trim_h) / 2
+
+    if margin_w < 1.0 and margin_h < 1.0:
+        # Keine Marge — keine Beschnittzeichen möglich
+        return False
+
+    # TrimBox in Punkten berechnen
+    mediabox = page.mediabox
+    trim_x0 = mediabox.x0 + (margin_w / PT_TO_MM)
+    trim_y0 = mediabox.y0 + (margin_h / PT_TO_MM)
+    trim_x1 = mediabox.x1 - (margin_w / PT_TO_MM)
+    trim_y1 = mediabox.y1 - (margin_h / PT_TO_MM)
+
     paths = page.get_drawings()
-    thin_lines = [p for p in paths if p.get("width", 1) < 0.6 and p.get("type") == "s"]
-    return len(thin_lines) > 12
+    cropmark_count = 0
+
+    for p in paths:
+        r = p.get("rect")
+        if r is None:
+            continue
+        stroke_w = p.get("width", 1.0)
+
+        # Beschnittzeichen sind typisch:
+        # 1. Dünne Linien (< 0.5pt)
+        # 2. Kurze Linien (5-20mm lang)
+        # 3. Liegen AUSSERHALB der TrimBox (in der Marge)
+        rect_w_pt = abs(r.x1 - r.x0)
+        rect_h_pt = abs(r.y1 - r.y0)
+        rect_w_mm = rect_w_pt * PT_TO_MM
+        rect_h_mm = rect_h_pt * PT_TO_MM
+
+        is_outside_trim = (
+            r.x1 < trim_x0 or r.x0 > trim_x1 or
+            r.y1 < trim_y0 or r.y0 > trim_y1
+        )
+
+        is_thin = stroke_w < 0.8
+        is_short = (rect_w_mm < 25 or rect_h_mm < 25)
+        is_line  = (rect_w_mm < 1.0 or rect_h_mm < 1.0)  # fast eindimensional
+
+        if is_outside_trim and is_thin and (is_short or is_line):
+            cropmark_count += 1
+
+    # Mindestens 4 Beschnittzeichen-Kandidaten = wahrscheinlich vorhanden
+    return cropmark_count >= 4
 
 
 # ─────────────────────────────────────────────
