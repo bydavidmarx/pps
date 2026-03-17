@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.1.0
+Backend API · Version 1.2
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -629,13 +629,87 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 
 
 # ─────────────────────────────────────────────
+#  USER STORE
+# ─────────────────────────────────────────────
+import json
+import os
+
+USERS_FILE = "users.json"
+ADMIN_EMAIL = "dm@dcp-online.de"
+ADMIN_PASSWORD = "supersize"
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_users(users):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f, indent=2)
+
+# ─────────────────────────────────────────────
+#  AUTH ENDPOINTS
+# ─────────────────────────────────────────────
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class UserRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+@app.post("/login")
+def login(req: LoginRequest):
+    email = req.email.strip().lower()
+    password = req.password.strip()
+    if email == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
+        return {"success": True, "role": "admin", "name": "Admin"}
+    users = load_users()
+    if email in users and users[email]["password"] == password:
+        return {"success": True, "role": "customer", "name": users[email]["name"]}
+    raise HTTPException(401, "E-Mail oder Passwort ungültig.")
+
+@app.get("/admin/users")
+def get_users(admin_email: str, admin_password: str):
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    users = load_users()
+    return {"users": [{"email": e, "name": d["name"]} for e, d in users.items()]}
+
+@app.post("/admin/users")
+def create_user(req: UserRequest, admin_email: str, admin_password: str):
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    users = load_users()
+    email = req.email.strip().lower()
+    users[email] = {"name": req.name.strip(), "password": req.password.strip()}
+    save_users(users)
+    return {"success": True, "message": f"Benutzer {email} angelegt."}
+
+@app.delete("/admin/users/{email}")
+def delete_user(email: str, admin_email: str, admin_password: str):
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    users = load_users()
+    email = email.strip().lower()
+    if email not in users:
+        raise HTTPException(404, "Benutzer nicht gefunden.")
+    del users[email]
+    save_users(users)
+    return {"success": True}
+
+# ─────────────────────────────────────────────
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.1.0"}
-
+    return {"status": "ok", "service": "PPS API", "version": "1.2.0"}
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
