@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.1.0
+Backend API · Version 1.0
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.0.0")
+app = FastAPI(title="PPS API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -633,7 +633,7 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.0.0"}
+    return {"status": "ok", "service": "PPS API", "version": "1.1.0"}
 
 
 if __name__ == "__main__":
