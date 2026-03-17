@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.3
+Backend API · Version 1.1.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.2.1")
+app = FastAPI(title="PPS API", version="1.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -672,6 +672,17 @@ def login(
         return {"success": True, "role": "customer", "name": users[email]["name"]}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
+@app.get("/login")
+def login_get(email: str, password: str):
+    email = email.strip().lower()
+    password = password.strip()
+    if email == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
+        return {"success": True, "role": "admin", "name": "Admin"}
+    users = load_users()
+    if email in users and users[email]["password"] == password:
+        return {"success": True, "role": "customer", "name": users[email]["name"]}
+    raise HTTPException(401, "E-Mail oder Passwort ungültig.")
+
 @app.get("/admin/users")
 def get_users(admin_email: str, admin_password: str):
     if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
@@ -706,7 +717,7 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.2.1"}
+    return {"status": "ok", "service": "PPS API", "version": "1.2.2"}
 
 if __name__ == "__main__":
     import uvicorn
