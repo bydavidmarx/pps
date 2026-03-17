@@ -143,3 +143,4 @@ const result = await response.json();
 - **User-Auth** via Supabase
 - **Job-History** — alle analysierten Dateien pro Kunde
 - **White-Label** — eigenes Logo und Farben pro Kunde
+- <!-- rebuild -->
