@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.2
+Backend API · Version 1.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.1.0")
+app = FastAPI(title="PPS API", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -653,19 +653,18 @@ def save_users(users):
 # ─────────────────────────────────────────────
 from pydantic import BaseModel
 
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
 class UserRequest(BaseModel):
     name: str
     email: str
     password: str
 
 @app.post("/login")
-def login(req: LoginRequest):
-    email = req.email.strip().lower()
-    password = req.password.strip()
+def login(
+    email: str = Form(...),
+    password: str = Form(...),
+):
+    email = email.strip().lower()
+    password = password.strip()
     if email == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
         return {"success": True, "role": "admin", "name": "Admin"}
     users = load_users()
@@ -707,7 +706,7 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.2.0"}
+    return {"status": "ok", "service": "PPS API", "version": "1.2.1"}
 
 if __name__ == "__main__":
     import uvicorn
