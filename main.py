@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.1.4
+Backend API · Version 1.2.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.2.2")
+app = FastAPI(title="PPS API", version="1.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -566,22 +566,15 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
         r = p.get("rect")
         if r is None:
             continue
-        stroke_w = p.get("width", 1.0)
-
-        # Beschnittzeichen sind typisch:
-        # 1. Dünne Linien (< 0.5pt)
-        # 2. Kurze Linien (5-20mm lang)
-        # 3. Liegen AUSSERHALB der TrimBox (in der Marge)
+        stroke_w = float(p.get("width") or 1.0)  # None-safe
         rect_w_pt = abs(r.x1 - r.x0)
         rect_h_pt = abs(r.y1 - r.y0)
         rect_w_mm = rect_w_pt * PT_TO_MM
         rect_h_mm = rect_h_pt * PT_TO_MM
-
         is_outside_trim = (
             r.x1 < trim_x0 or r.x0 > trim_x1 or
             r.y1 < trim_y0 or r.y0 > trim_y1
         )
-
         is_thin = stroke_w < 0.8
         is_short = (rect_w_mm < 25 or rect_h_mm < 25)
         is_line  = (rect_w_mm < 1.0 or rect_h_mm < 1.0)  # fast eindimensional
@@ -717,7 +710,7 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.2.2"}
+    return {"status": "ok", "service": "PPS API", "version": "1.2.3"}
 
 if __name__ == "__main__":
     import uvicorn
