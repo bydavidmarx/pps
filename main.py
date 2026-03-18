@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.3
+Backend API · Version 1.6.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -693,10 +693,12 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             img_up = img.resize((new_w, new_h), Image.LANCZOS)
 
             out_buf = _io.BytesIO()
-            # PNG für verlustfreie Einbettung (kein Korruptionsrisiko)
             if img.mode == 'CMYK':
-                img_up = img_up.convert('RGB')
-            img_up.save(out_buf, format="PNG")
+                # CMYK als JPEG behalten — KEINE RGB-Konvertierung
+                # RGB-Konvertierung invertiert CMYK-Farben
+                img_up.save(out_buf, format="JPEG", quality=95)
+            else:
+                img_up.save(out_buf, format="PNG")
             up_bytes = out_buf.getvalue()
 
             place_rect = fitz.Rect(item["rect"].x0, item["rect"].y0,
@@ -1073,7 +1075,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.3"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.4"}
 
 if __name__ == "__main__":
     import uvicorn
