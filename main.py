@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.5.1
+Backend API · Version 1.5
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -601,6 +601,50 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
 # ─────────────────────────────────────────────
 #  FIX LOGIC
 # ─────────────────────────────────────────────
+def _estimate_trim_area(page, mediabox):
+    """
+    Wenn keine TrimBox vorhanden: schätze den echten Druckbereich
+    indem wir dünne Linien/Beschnittzeichen am Rand erkennen und
+    den Bereich dahinter als Druckfläche definieren.
+    """
+    paths = page.get_drawings()
+    mw = (mediabox.x1 - mediabox.x0) * PT_TO_MM
+    mh = (mediabox.y1 - mediabox.y0) * PT_TO_MM
+
+    # Suche nach Beschnittzeichen-Linien am Rand
+    # Typisch: dünne kurze Linien in den ersten/letzten 10% der Seite
+    margin_threshold_pt = min(mediabox.width, mediabox.height) * 0.08
+
+    has_top_marks = False
+    has_left_marks = False
+
+    for p in paths:
+        r = p.get("rect")
+        if r is None:
+            continue
+        stroke_w = float(p.get("width") or 1.0)
+        if stroke_w > 1.0:
+            continue
+        # Check if element is in top margin
+        if r.y0 < mediabox.y0 + margin_threshold_pt:
+            has_top_marks = True
+        # Check if element is in left margin
+        if r.x0 < mediabox.x0 + margin_threshold_pt:
+            has_left_marks = True
+
+    if has_top_marks or has_left_marks:
+        # Schneide Randbereich ab (geschätzte Beschnittzeichen-Marge)
+        margin = margin_threshold_pt * 0.6
+        return fitz.Rect(
+            mediabox.x0 + margin,
+            mediabox.y0 + margin,
+            mediabox.x1 - margin,
+            mediabox.y1 - margin
+        )
+
+    return mediabox
+
+
 def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_bleed, fix_colorspace):
     """
     Fix-Reihenfolge:
@@ -628,15 +672,19 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         expected_bleed_pt = expected_bleed_mm / PT_TO_MM
 
         page = doc[0]
-
-        # Nur den TrimBox-Bereich rendern (OHNE Beschnittzeichen außen)
         trimbox = page.trimbox
         mediabox = page.mediabox
+
+        # Bestimme den echten Druckbereich:
+        # 1. TrimBox vorhanden → nutze TrimBox
+        # 2. Keine TrimBox aber Beschnittzeichen → nutze MediaBox minus erkannte Marge
+        # 3. Sonst → nutze gesamte MediaBox
         if trimbox and trimbox != mediabox:
-            # Clip auf TrimBox bevor wir rendern
             clip_rect = trimbox
         else:
-            clip_rect = page.rect
+            # Keine TrimBox — versuche Beschnittzeichen-Bereich zu schätzen
+            # durch Analyse der Zeichenpfade außerhalb des Kernbereichs
+            clip_rect = _estimate_trim_area(page, mediabox)
 
         W = clip_rect.width
         H = clip_rect.height
@@ -645,7 +693,6 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         dpi = 150
         scale_factor = dpi / 72.0
         mat = fitz.Matrix(scale_factor, scale_factor)
-        # Pixmap nur vom TrimBox-Bereich
         pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip_rect)
 
         pw = pix.width   # Pixmap-Breite
@@ -873,7 +920,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.5.1"}
+    return {"status": "ok", "service": "PPS API", "version": "1.5.2"}
 
 if __name__ == "__main__":
     import uvicorn
