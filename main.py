@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.3.2")
+app = FastAPI(title="PPS API", version="1.3.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -705,71 +705,62 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 
 
 # ─────────────────────────────────────────────
-#  USER STORE — Railway Environment Variable
-#  Überlebt Redeploys, kein Volume nötig
+#  USER STORE — JSONBin.io (kostenlos, persistent)
+#  Kein Volume, kein Railway-API-Trick nötig
 # ─────────────────────────────────────────────
 import json
 import os
+import urllib.request
 
 ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL", "dm@dcp-online.de")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "supersize")
-USERS_VAR      = "PPS_USERS"  # Name der Railway-Variable
+JSONBIN_KEY    = os.environ.get("JSONBIN_KEY", "")
+JSONBIN_BIN_ID = os.environ.get("JSONBIN_BIN_ID", "")
+JSONBIN_URL    = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+
+# In-Memory Cache für laufende Session
+_users_cache: dict = {}
+_cache_loaded: bool = False
 
 def load_users() -> dict:
-    """Liest Nutzer aus der Umgebungsvariable PPS_USERS."""
-    raw = os.environ.get(USERS_VAR, "")
-    if not raw:
-        return {}
+    global _users_cache, _cache_loaded
+    if _cache_loaded:
+        return _users_cache
+    if not JSONBIN_KEY or not JSONBIN_BIN_ID:
+        return _users_cache
     try:
-        return json.loads(raw)
+        req = urllib.request.Request(
+            JSONBIN_URL + "/latest",
+            headers={"X-Master-Key": JSONBIN_KEY}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            _users_cache = data.get("record", {}).get("users", {})
+            _cache_loaded = True
     except Exception:
-        return {}
+        pass
+    return _users_cache
 
 def save_users(users: dict):
-    """
-    Schreibt Nutzer zurück in die Umgebungsvariable via Railway API.
-    Fallback: in-memory (geht verloren bei Redeploy, aber selten nötig).
-    """
-    import urllib.request, urllib.error
-    token   = os.environ.get("RAILWAY_TOKEN", "")
-    svc_id  = os.environ.get("RAILWAY_SERVICE_ID", "")
-    env_id  = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
-    proj_id = os.environ.get("RAILWAY_PROJECT_ID", "")
-
-    # Immer in os.environ schreiben (für laufende Session)
-    os.environ[USERS_VAR] = json.dumps(users)
-
-    # Persistenz via Railway GraphQL API
-    if not all([token, svc_id, env_id, proj_id]):
-        # Kein Token → nur In-Memory (reicht für Tests)
+    global _users_cache, _cache_loaded
+    _users_cache = users
+    _cache_loaded = True
+    if not JSONBIN_KEY or not JSONBIN_BIN_ID:
         return
-
-    query = """
-    mutation UpsertVariables($input: VariableCollectionUpsertInput!) {
-      variableCollectionUpsert(input: $input)
-    }
-    """
-    variables = {
-        "input": {
-            "projectId": proj_id,
-            "environmentId": env_id,
-            "serviceId": svc_id,
-            "variables": {USERS_VAR: json.dumps(users)}
-        }
-    }
-    payload = json.dumps({"query": query, "variables": variables}).encode()
-    req = urllib.request.Request(
-        "https://backboard.railway.app/graphql/v2",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-    )
     try:
+        payload = json.dumps({"users": users}).encode()
+        req = urllib.request.Request(
+            JSONBIN_URL,
+            data=payload,
+            method="PUT",
+            headers={
+                "Content-Type": "application/json",
+                "X-Master-Key": JSONBIN_KEY
+            }
+        )
         urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass  # Stille Fehler — In-Memory bleibt gültig
+    except Exception as e:
+        raise HTTPException(500, f"Speichern fehlgeschlagen: {e}")
 
 # ─────────────────────────────────────────────
 #  AUTH ENDPOINTS
@@ -840,7 +831,7 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.3.2"}
+    return {"status": "ok", "service": "PPS API", "version": "1.3.3"}
 
 if __name__ == "__main__":
     import uvicorn
