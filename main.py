@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.5.5
+Backend API · Version 1.5.6
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -67,6 +67,7 @@ async def fix_pdf(
     fix_cropmarks: bool = Form(True),
     fix_bleed: bool = Form(True),
     fix_colorspace: bool = Form(False),
+    fix_resolution: bool = Form(False),
 ):
     data = await file.read()
     try:
@@ -74,11 +75,19 @@ async def fix_pdf(
     except Exception:
         raise HTTPException(422, "PDF konnte nicht geöffnet werden.")
 
+    # Upscaling vor dem Bleed-Fix (damit Randspiegelung mit hochgerechneten Bildern arbeitet)
+    upscaled_count = 0
+    if fix_resolution:
+        doc, upscaled_count = upscale_images_in_pdf(doc, scale)
+
     fixed_pdf, fixes_applied = apply_fixes(
         doc, data, print_width_mm, print_height_mm, scale,
         fix_cropmarks, fix_bleed, fix_colorspace
     )
     doc.close()
+
+    if upscaled_count > 0:
+        fixes_applied.append(f"{upscaled_count} Bild(er) hochgerechnet (Lanczos 2x)")
 
     filename = file.filename.replace(".pdf", "") + "_PPS_fixed.pdf"
     return Response(
@@ -594,6 +603,104 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
 
 
 # ─────────────────────────────────────────────
+#  IMAGE UPSCALING
+# ─────────────────────────────────────────────
+def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
+    """
+    Findet alle Bilder unter min_dpi_1to1 und verdoppelt deren Auflösung
+    mit Lanczos-Resampling. Setzt sie an exakt gleicher Position ein.
+    Gibt (modified_doc, count) zurück.
+    """
+    from PIL import Image
+    import io as _io
+
+    page = doc[0]
+    image_list = page.get_images(full=True)
+    upscaled_count = 0
+
+    for img_info in image_list:
+        xref = img_info[0]
+        try:
+            base_image = doc.extract_image(xref)
+            img_w_px = base_image["width"]
+            img_h_px = base_image["height"]
+            img_bytes = base_image["image"]
+            img_ext = base_image["ext"]
+            colorspace = base_image.get("colorspace", 3)
+
+            # Berechne effektive DPI
+            img_rects = page.get_image_rects(xref)
+            if not img_rects:
+                continue
+            r = img_rects[0]
+            placed_w_mm = (r.x1 - r.x0) * PT_TO_MM
+            placed_h_mm = (r.y1 - r.y0) * PT_TO_MM
+            if placed_w_mm <= 0 or placed_h_mm <= 0:
+                continue
+
+            dpi_doc = min(
+                img_w_px / (placed_w_mm / 25.4),
+                img_h_px / (placed_h_mm / 25.4)
+            )
+            dpi_1to1 = dpi_doc / scale
+
+            # Nur Bilder unter Minimum hochrechnen
+            if dpi_1to1 >= min_dpi_1to1:
+                continue
+            # Bilder unter 25 DPI (1:1) sind zu schlecht — kein Upscaling
+            if dpi_1to1 < 25.0:
+                continue
+
+            # Faktor berechnen: auf Ziel-DPI bringen
+            target_dpi_1to1 = min_dpi_1to1
+            factor = target_dpi_1to1 / dpi_1to1
+            # Maximal 4x hochrechnen
+            factor = min(factor, 4.0)
+            new_w = int(img_w_px * factor)
+            new_h = int(img_h_px * factor)
+
+            # Bild laden und hochrechnen
+            img = Image.open(_io.BytesIO(img_bytes))
+
+            # CMYK korrekt behandeln
+            if img.mode == 'CMYK':
+                img_up = img.resize((new_w, new_h), Image.LANCZOS)
+                out_buf = _io.BytesIO()
+                img_up.save(out_buf, format="JPEG", quality=92)
+            elif img.mode in ('RGB', 'L'):
+                img_up = img.resize((new_w, new_h), Image.LANCZOS)
+                out_buf = _io.BytesIO()
+                img_up.save(out_buf, format="JPEG", quality=92)
+            else:
+                img_up = img.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
+                out_buf = _io.BytesIO()
+                img_up.save(out_buf, format="JPEG", quality=92)
+
+            new_img_bytes = out_buf.getvalue()
+
+            # Altes Bild ersetzen
+            doc.update_stream(xref, new_img_bytes)
+
+            # Bildgröße-Metadaten aktualisieren
+            doc.xref_set_key(xref, "Width", str(new_w))
+            doc.xref_set_key(xref, "Height", str(new_h))
+            doc.xref_set_key(xref, "Filter", "/DCTDecode")
+
+            upscaled_count += 1
+            import sys
+            print(f"[PPS] upscaled xref={xref}: {img_w_px}x{img_h_px} → {new_w}x{new_h} "
+                  f"({dpi_1to1:.1f} → {dpi_1to1*factor:.1f} DPI@1:1, factor={factor:.1f}x)",
+                  file=sys.stderr)
+
+        except Exception as e:
+            import sys
+            print(f"[PPS] upscale error xref={xref}: {e}", file=sys.stderr)
+            continue
+
+    return doc, upscaled_count
+
+
+# ─────────────────────────────────────────────
 #  FIX LOGIC
 # ─────────────────────────────────────────────
 def _estimate_trim_area(page, mediabox):
@@ -950,7 +1057,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.5.5"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.0"}
 
 if __name__ == "__main__":
     import uvicorn
