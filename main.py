@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.5
+Backend API · Version 1.5.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -603,46 +603,63 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
 # ─────────────────────────────────────────────
 def _estimate_trim_area(page, mediabox):
     """
-    Wenn keine TrimBox vorhanden: schätze den echten Druckbereich
-    indem wir dünne Linien/Beschnittzeichen am Rand erkennen und
-    den Bereich dahinter als Druckfläche definieren.
+    Bestimme den echten Druckbereich ohne TrimBox.
+    Strategie: Finde den kleinsten Bounding-Box aller Bild-Inhalte
+    und nutze das als TrimBox-Schätzung.
+    Alternativ: Finde die äußersten Beschnittzeichen-Koordinaten
+    und leite daraus die TrimBox ab.
     """
+    import sys
     paths = page.get_drawings()
-    mw = (mediabox.x1 - mediabox.x0) * PT_TO_MM
-    mh = (mediabox.y1 - mediabox.y0) * PT_TO_MM
 
-    # Suche nach Beschnittzeichen-Linien am Rand
-    # Typisch: dünne kurze Linien in den ersten/letzten 10% der Seite
-    margin_threshold_pt = min(mediabox.width, mediabox.height) * 0.08
-
-    has_top_marks = False
-    has_left_marks = False
-
+    # Sammle alle dünnen Linien die außerhalb des Hauptbereichs liegen
+    # Beschnittzeichen haben typisch: width < 1pt, Länge 3-15mm
+    thin_lines = []
     for p in paths:
         r = p.get("rect")
         if r is None:
             continue
         stroke_w = float(p.get("width") or 1.0)
-        if stroke_w > 1.0:
+        if stroke_w > 1.5:
             continue
-        # Check if element is in top margin
-        if r.y0 < mediabox.y0 + margin_threshold_pt:
-            has_top_marks = True
-        # Check if element is in left margin
-        if r.x0 < mediabox.x0 + margin_threshold_pt:
-            has_left_marks = True
+        rect_w = abs(r.x1 - r.x0) * PT_TO_MM
+        rect_h = abs(r.y1 - r.y0) * PT_TO_MM
+        # Typische Beschnittzeichen: sehr kurz in einer Dimension
+        if rect_w < 0.5 or rect_h < 0.5:
+            thin_lines.append(r)
 
-    if has_top_marks or has_left_marks:
-        # Schneide Randbereich ab (geschätzte Beschnittzeichen-Marge)
-        margin = margin_threshold_pt * 0.6
-        return fitz.Rect(
-            mediabox.x0 + margin,
-            mediabox.y0 + margin,
-            mediabox.x1 - margin,
-            mediabox.y1 - margin
-        )
+    if not thin_lines:
+        return mediabox
 
-    return mediabox
+    # Finde die innersten Koordinaten der Beschnittzeichen
+    # Das ergibt uns die TrimBox-Ecken
+    # Beschnittzeichen zeigen NACH INNEN → die inneren Enden definieren die TrimBox
+
+    # Sortiere nach Position
+    left_lines   = [r for r in thin_lines if (r.x0 - mediabox.x0) * PT_TO_MM < 15]
+    right_lines  = [r for r in thin_lines if (mediabox.x1 - r.x1) * PT_TO_MM < 15]
+    top_lines    = [r for r in thin_lines if (r.y0 - mediabox.y0) * PT_TO_MM < 15]
+    bottom_lines = [r for r in thin_lines if (mediabox.y1 - r.y1) * PT_TO_MM < 15]
+
+    # Berechne TrimBox aus den innersten Punkten der Cropmarks
+    x0 = max((r.x1 for r in left_lines), default=mediabox.x0)
+    x1 = min((r.x0 for r in right_lines), default=mediabox.x1)
+    y0 = max((r.y1 for r in top_lines), default=mediabox.y0)
+    y1 = min((r.y0 for r in bottom_lines), default=mediabox.y1)
+
+    print(f"[PPS] estimate_trim: x0={x0:.1f} y0={y0:.1f} x1={x1:.1f} y1={y1:.1f}", file=sys.stderr)
+    print(f"[PPS] mediabox: x0={mediabox.x0:.1f} y0={mediabox.y0:.1f} x1={mediabox.x1:.1f} y1={mediabox.y1:.1f}", file=sys.stderr)
+    print(f"[PPS] thin_lines: {len(thin_lines)}, left:{len(left_lines)} right:{len(right_lines)} top:{len(top_lines)} bot:{len(bottom_lines)}", file=sys.stderr)
+
+    # Validierung: TrimBox muss sinnvoll sein
+    if x0 >= x1 or y0 >= y1:
+        return mediabox
+    if (x1 - x0) < mediabox.width * 0.5:
+        return mediabox  # zu viel abgeschnitten
+    if (y1 - y0) < mediabox.height * 0.5:
+        return mediabox
+
+    return fitz.Rect(x0, y0, x1, y1)
 
 
 def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_bleed, fix_colorspace):
@@ -920,7 +937,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.5.2"}
+    return {"status": "ok", "service": "PPS API", "version": "1.5.3"}
 
 if __name__ == "__main__":
     import uvicorn
