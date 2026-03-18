@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.5.6
+Backend API · Version 1.6.1
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -678,13 +678,15 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
 
             new_img_bytes = out_buf.getvalue()
 
-            # Altes Bild ersetzen
-            doc.update_stream(xref, new_img_bytes)
+            # Bild korrekt ersetzen via insert_image
+            # Erst altes Bild aus Seite entfernen, dann neues einfügen
+            img_buf = _io.BytesIO(new_img_bytes)
 
-            # Bildgröße-Metadaten aktualisieren
-            doc.xref_set_key(xref, "Width", str(new_w))
-            doc.xref_set_key(xref, "Height", str(new_h))
-            doc.xref_set_key(xref, "Filter", "/DCTDecode")
+            # Platzierungsrechteck aus der Seite holen
+            place_rect = fitz.Rect(r.x0, r.y0, r.x1, r.y1)
+
+            # Neues Bild einfügen an gleicher Position
+            page.insert_image(place_rect, stream=new_img_bytes, xref=xref)
 
             upscaled_count += 1
             import sys
@@ -1057,7 +1059,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.0"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.1"}
 
 if __name__ == "__main__":
     import uvicorn
