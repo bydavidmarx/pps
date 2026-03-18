@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.3.4
+Backend API · Version 1.3.7
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.3.5")
+app = FastAPI(title="PPS API", version="1.3.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -705,78 +705,59 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 
 
 # ─────────────────────────────────────────────
-#  USER STORE — JSONBin.io (kostenlos, persistent)
-#  Kein Volume, kein Railway-API-Trick nötig
+#  USER STORE — In-Memory + KV-Store via kvdb.io
+#  Kostenlos, kein Setup, persistent
 # ─────────────────────────────────────────────
 import json
 import os
 import urllib.request
+import urllib.error
 
 ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL", "dm@dcp-online.de")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "supersize")
-JSONBIN_KEY    = os.environ.get("JSONBIN_KEY", "")
-JSONBIN_BIN_ID = os.environ.get("JSONBIN_BIN_ID", "")
-JSONBIN_URL    = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+KV_BUCKET      = os.environ.get("KV_BUCKET", "")   # kvdb.io bucket ID
+KV_URL         = f"https://kvdb.io/{KV_BUCKET}/pps_users"
 
-# In-Memory Cache für laufende Session
-_users_cache: dict = {}
-_cache_loaded: bool = False
+# In-Memory für laufende Session
+_users: dict = {}
+_loaded: bool = False
 
 def load_users() -> dict:
-    global _users_cache, _cache_loaded
-    if _cache_loaded:
-        return _users_cache
-    if not JSONBIN_KEY or not JSONBIN_BIN_ID:
-        return _users_cache
+    global _users, _loaded
+    if _loaded:
+        return _users
+    if not KV_BUCKET:
+        _loaded = True
+        return _users
     try:
-        req = urllib.request.Request(
-            JSONBIN_URL + "/latest",
-            headers={"X-Master-Key": JSONBIN_KEY}
-        )
+        req = urllib.request.Request(KV_URL)
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            record = data.get("record", {})
-            users_raw = record.get("users", {})
-            # Kompatibilität: Array-Format → Dict konvertieren
-            if isinstance(users_raw, list):
-                users_dict = {}
-                for u in users_raw:
-                    if "email" in u and "name" in u:
-                        users_dict[u["email"]] = {
-                            "name": u["name"],
-                            "password": u.get("password", "")
-                        }
-                _users_cache = users_dict
-            else:
-                _users_cache = users_raw
-            _cache_loaded = True
+            raw = resp.read().decode()
+            if raw:
+                _users = json.loads(raw)
     except Exception:
-        pass
-    return _users_cache
+        _users = {}
+    _loaded = True
+    return _users
 
 def save_users(users: dict):
-    global _users_cache, _cache_loaded
-    _users_cache = users
-    _cache_loaded = True
-    if not JSONBIN_KEY or not JSONBIN_BIN_ID:
+    global _users, _loaded
+    _users = users
+    _loaded = True
+    if not KV_BUCKET:
         return
     try:
-        payload = json.dumps({"users": users}).encode()
+        payload = json.dumps(users).encode()
         req = urllib.request.Request(
-            JSONBIN_URL,
+            KV_URL,
             data=payload,
-            method="PUT",
-            headers={
-                "Content-Type": "application/json",
-                "X-Master-Key": JSONBIN_KEY,
-                "X-Bin-Private": "true"
-            }
+            method="POST",
+            headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            pass  # OK
+        urllib.request.urlopen(req, timeout=10)
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        raise HTTPException(500, f"JSONBin Fehler {e.code}: {body}")
+        raise HTTPException(500, f"KV Fehler {e.code}: {body}")
     except Exception as e:
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
 
@@ -847,9 +828,26 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
+@app.get("/debug/jsonbin")
+def debug_jsonbin():
+    key = os.environ.get("JSONBIN_KEY", "")
+    bin_id = os.environ.get("JSONBIN_BIN_ID", "")
+    if not key or not bin_id:
+        return {"error": "Variablen fehlen", "key_set": bool(key), "bin_id_set": bool(bin_id)}
+    url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
+    try:
+        req = urllib.request.Request(url, headers={"X-Master-Key": key})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            return {"status": "ok", "record": data.get("record")}
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}", "body": e.read().decode()}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.3.5"}
+    return {"status": "ok", "service": "PPS API", "version": "1.3.7"}
 
 if __name__ == "__main__":
     import uvicorn
