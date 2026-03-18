@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.4.0
+Backend API · Version 1.4.2
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -746,20 +746,25 @@ def save_users(users: dict):
     _loaded = True
     if not KV_BUCKET:
         return
+    import sys
+    print(f"[PPS] save_users: bucket={KV_BUCKET}, url={KV_URL}", file=sys.stderr)
     try:
         payload = json.dumps(users).encode()
-        # kvdb.io uses PUT to store a value
         req = urllib.request.Request(
             KV_URL,
             data=payload,
             method="PUT",
             headers={"Content-Type": "application/json"}
         )
-        urllib.request.urlopen(req, timeout=10)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = resp.read().decode()
+            print(f"[PPS] save_users: OK - {result}", file=sys.stderr)
     except urllib.error.HTTPError as e:
         body = e.read().decode()
+        print(f"[PPS] save_users: HTTPError {e.code} - {body}", file=sys.stderr)
         raise HTTPException(500, f"KV Fehler {e.code}: {body}")
     except Exception as e:
+        print(f"[PPS] save_users: Exception - {str(e)}", file=sys.stderr)
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
 
 # ─────────────────────────────────────────────
@@ -847,7 +852,7 @@ def debug_kv():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.4.0"}
+    return {"status": "ok", "service": "PPS API", "version": "1.4.1"}
 
 if __name__ == "__main__":
     import uvicorn
