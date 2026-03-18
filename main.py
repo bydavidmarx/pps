@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.2.3
+Backend API · Version 1.2.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.2.3")
+app = FastAPI(title="PPS API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,33 +101,44 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
     pdf_w_mm = rect.width * PT_TO_MM
     pdf_h_mm = rect.height * PT_TO_MM
 
-    # MediaBox vs TrimBox vs BleedBox
+    # ── Box-Analyse ──
     mediabox = page.mediabox
     trimbox  = page.trimbox if page.trimbox != page.mediabox else None
-    bleedbox = None
-    try:
-        bleedbox = fitz.Rect(page.get_bboxlog())
-    except Exception:
-        pass
 
     media_w_mm = (mediabox.x1 - mediabox.x0) * PT_TO_MM
     media_h_mm = (mediabox.y1 - mediabox.y0) * PT_TO_MM
+    trim_w_mm  = (trimbox.x1 - trimbox.x0) * PT_TO_MM if trimbox else media_w_mm
+    trim_h_mm  = (trimbox.y1 - trimbox.y0) * PT_TO_MM if trimbox else media_h_mm
 
-    trim_w_mm = (trimbox.x1 - trimbox.x0) * PT_TO_MM if trimbox else media_w_mm
-    trim_h_mm = (trimbox.y1 - trimbox.y0) * PT_TO_MM if trimbox else media_h_mm
-
-    bleed_mm = ((media_w_mm - trim_w_mm) / 2 + (media_h_mm - trim_h_mm) / 2) / 2
-
-    expected_w_mm = print_w / scale
-    expected_h_mm = print_h / scale
+    expected_w_mm    = print_w / scale
+    expected_h_mm    = print_h / scale
     expected_bleed_mm = 20.0 / scale
 
-    # Ratio check
+    # ── Beschnittzeichen zuerst erkennen ──
+    # Wichtig: BEVOR wir Beschnitt berechnen, damit wir nicht
+    # Beschnittzeichen-Fläche als echten Beschnitt werten
+    has_cropmarks = detect_cropmarks(page, media_w_mm, media_h_mm, trim_w_mm, trim_h_mm)
+
+    # ── Echter Beschnitt berechnen ──
+    # Wenn Beschnittzeichen vorhanden: MediaBox-Überschuss = Beschnittzeichen-Bereich
+    # → kein echter Beschnitt vorhanden
+    # Wenn keine Beschnittzeichen: MediaBox-Überschuss = echter Beschnitt
+    if has_cropmarks and trimbox:
+        # TrimBox definiert den Druckbereich — Beschnitt ist 0 weil nur Zeichen außen
+        bleed_mm = 0.0
+    elif trimbox:
+        # BleedBox = MediaBox, TrimBox kleiner → echter Beschnitt
+        bleed_mm = ((media_w_mm - trim_w_mm) / 2 + (media_h_mm - trim_h_mm) / 2) / 2
+    else:
+        # Keine TrimBox → kein Beschnitt erkennbar
+        bleed_mm = 0.0
+
+    # ── Ratio check (immer auf TrimBox-Basis) ──
     ratio_diff_w = abs(trim_w_mm - expected_w_mm)
     ratio_diff_h = abs(trim_h_mm - expected_h_mm)
     ratio_ok = ratio_diff_w < 3 and ratio_diff_h < 3
 
-    # Bleed check
+    # ── Bleed Status ──
     bleed_diff = abs(bleed_mm - expected_bleed_mm)
     if bleed_mm < 0.5:
         bleed_status = "error"
@@ -135,9 +146,6 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
         bleed_status = "warn"
     else:
         bleed_status = "ok"
-
-    # Crop marks detection
-    has_cropmarks = detect_cropmarks(page, media_w_mm, media_h_mm, trim_w_mm, trim_h_mm)
 
     # Image resolution analysis (the key feature)
     images = analyze_images(page, doc, print_w, print_h, scale)
@@ -179,30 +187,34 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
                     "expected_w": round(expected_w_mm, 1), "expected_h": round(expected_h_mm, 1)}
     })
 
-    # 3. Bleed
+    # 3. Bleed — PRIORITÄT: wichtiger als Beschnittzeichen
+    bleed_note = {
+        "ok": f"Beschnittzugabe korrekt ({bleed_mm:.1f} mm = {bleed_mm*scale:.0f} mm bei 1:1).",
+        "warn": f"Zugabe {bleed_mm:.1f} mm weicht vom Sollwert {expected_bleed_mm:.1f} mm ab.",
+        "error": f"Keine Beschnittzugabe erkannt! Benötigt: {expected_bleed_mm:.1f} mm (= 20 mm bei 1:1). Fix It erstellt Beschnitt durch Randspiegelung."
+    }[bleed_status]
+    if has_cropmarks and bleed_status == "error":
+        bleed_note = f"Beschnittzeichen vorhanden, aber KEINE echte Beschnittzugabe! Nach dem Entfernen der Zeichen fehlen {expected_bleed_mm:.1f} mm Beschnitt. Fix It löst beides."
     checks.append({
         "id": "bleed",
         "label": "Beschnittzugabe",
         "status": bleed_status,
         "value": f"{bleed_mm:.1f} mm erkannt · Erwartet: {expected_bleed_mm:.1f} mm (= 20 mm bei 1:1)",
-        "note": {
-            "ok": f"Beschnittzugabe korrekt ({bleed_mm:.1f} mm).",
-            "warn": f"Zugabe {bleed_mm:.1f} mm weicht vom Sollwert {expected_bleed_mm:.1f} mm ab.",
-            "error": f"Keine Beschnittzugabe erkannt! Mindestens {expected_bleed_mm:.1f} mm nötig."
-        }[bleed_status],
-        "fixable": bleed_status == "error",
-        "details": {"bleed_mm": round(bleed_mm, 2), "expected_mm": round(expected_bleed_mm, 2)}
+        "note": bleed_note,
+        "fixable": bleed_status != "ok",
+        "details": {"bleed_mm": round(bleed_mm, 2), "expected_mm": round(expected_bleed_mm, 2),
+                    "has_cropmarks": has_cropmarks}
     })
 
-    # 4. Crop marks
+    # 4. Crop marks — als Warnung, nicht als Fehler
     checks.append({
         "id": "cropmarks",
         "label": "Beschnittzeichen",
-        "status": "error" if has_cropmarks else "ok",
-        "value": "Vorhanden — müssen entfernt werden" if has_cropmarks else "Keine vorhanden",
-        "note": "Beschnittzeichen außerhalb der TrimBox erkannt. Beim Druck störend — bitte entfernen oder 'Fix It' nutzen." if has_cropmarks
+        "status": "warn" if has_cropmarks else "ok",
+        "value": "Vorhanden — werden beim Fix entfernt" if has_cropmarks else "Keine vorhanden",
+        "note": "Beschnittzeichen erkannt. Diese werden automatisch entfernt wenn du 'Fix It' für die Beschnittzugabe verwendest." if has_cropmarks
                 else "Keine Beschnittzeichen erkannt — korrekt.",
-        "fixable": has_cropmarks,
+        "fixable": False,
         "details": {"detected": has_cropmarks}
     })
 
@@ -590,28 +602,99 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
 #  FIX LOGIC
 # ─────────────────────────────────────────────
 def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_bleed, fix_colorspace):
+    """
+    Fix-Reihenfolge:
+    1. Beschnittzeichen entfernen (Clip auf TrimBox)
+    2. Beschnittzugabe durch Randspiegelung hinzufügen
+    """
     fixes_applied = []
     page = doc[0]
 
-    if fix_cropmarks:
-        # Clip to TrimBox — removes cropmarks outside print area
-        trimbox = page.trimbox
-        if trimbox and trimbox != page.mediabox:
-            page.set_cropbox(trimbox)
-            page.set_mediabox(trimbox)
-            fixes_applied.append("Beschnittzeichen entfernt")
+    # ── Schritt 1: Beschnittzeichen entfernen ──
+    # Immer ausführen wenn Beschnitt gefixt wird (Zeichen stören sonst)
+    trimbox = page.trimbox
+    mediabox = page.mediabox
+    has_trimbox = trimbox and trimbox != mediabox
 
+    if (fix_cropmarks or fix_bleed) and has_trimbox:
+        # Auf TrimBox zuschneiden → Beschnittzeichen außen fallen weg
+        page.set_cropbox(trimbox)
+        page.set_mediabox(trimbox)
+        fixes_applied.append("Beschnittzeichen entfernt")
+
+    # ── Schritt 2: Beschnittzugabe durch Randspiegelung ──
     if fix_bleed:
-        expected_bleed_pt = (20.0 / scale) / PT_TO_MM
+        expected_bleed_mm = 20.0 / scale
+        expected_bleed_pt = expected_bleed_mm / PT_TO_MM
+
+        # Aktuellen Druckbereich holen (nach Crop-Schritt)
+        page = doc[0]
         rect = page.rect
-        new_rect = fitz.Rect(
-            rect.x0 - expected_bleed_pt,
-            rect.y0 - expected_bleed_pt,
-            rect.x1 + expected_bleed_pt,
-            rect.y1 + expected_bleed_pt,
-        )
-        page.set_mediabox(new_rect)
-        fixes_applied.append(f"Beschnittzugabe {20.0/scale:.1f} mm hinzugefügt")
+        page_w_pt = rect.width
+        page_h_pt = rect.height
+
+        # Neues Dokument mit erweiterter Seite
+        new_doc = fitz.open()
+        new_w = page_w_pt + 2 * expected_bleed_pt
+        new_h = page_h_pt + 2 * expected_bleed_pt
+        new_page = new_doc.new_page(width=new_w, height=new_h)
+
+        # Originalen Inhalt in die Mitte einbetten
+        src_rect = fitz.Rect(0, 0, page_w_pt, page_h_pt)
+        dst_rect = fitz.Rect(expected_bleed_pt, expected_bleed_pt,
+                             expected_bleed_pt + page_w_pt,
+                             expected_bleed_pt + page_h_pt)
+        new_page.show_pdf_page(dst_rect, doc, 0)
+
+        # Randspiegelung — vier Seiten
+        # Links (gespiegelt horizontal)
+        left_src = fitz.Rect(0, 0, expected_bleed_pt, page_h_pt)
+        left_dst = fitz.Rect(0, expected_bleed_pt, expected_bleed_pt,
+                             expected_bleed_pt + page_h_pt)
+        new_page.show_pdf_page(left_dst, doc, 0,
+                               clip=fitz.Rect(0, 0, expected_bleed_pt, page_h_pt),
+                               rotate=0)
+
+        # Rechts (gespiegelt horizontal)
+        right_src_x = page_w_pt - expected_bleed_pt
+        right_dst = fitz.Rect(expected_bleed_pt + page_w_pt, expected_bleed_pt,
+                              new_w, expected_bleed_pt + page_h_pt)
+        new_page.show_pdf_page(right_dst, doc, 0,
+                               clip=fitz.Rect(right_src_x, 0, page_w_pt, page_h_pt))
+
+        # Oben (gespiegelt vertikal)
+        top_dst = fitz.Rect(expected_bleed_pt, 0,
+                            expected_bleed_pt + page_w_pt, expected_bleed_pt)
+        new_page.show_pdf_page(top_dst, doc, 0,
+                               clip=fitz.Rect(0, 0, page_w_pt, expected_bleed_pt))
+
+        # Unten (gespiegelt vertikal)
+        bot_src_y = page_h_pt - expected_bleed_pt
+        bot_dst = fitz.Rect(expected_bleed_pt, expected_bleed_pt + page_h_pt,
+                            expected_bleed_pt + page_w_pt, new_h)
+        new_page.show_pdf_page(bot_dst, doc, 0,
+                               clip=fitz.Rect(0, bot_src_y, page_w_pt, page_h_pt))
+
+        # Ecken (Kombination)
+        # Oben-links
+        new_page.show_pdf_page(fitz.Rect(0, 0, expected_bleed_pt, expected_bleed_pt),
+                               doc, 0, clip=fitz.Rect(0, 0, expected_bleed_pt, expected_bleed_pt))
+        # Oben-rechts
+        new_page.show_pdf_page(fitz.Rect(expected_bleed_pt+page_w_pt, 0, new_w, expected_bleed_pt),
+                               doc, 0, clip=fitz.Rect(right_src_x, 0, page_w_pt, expected_bleed_pt))
+        # Unten-links
+        new_page.show_pdf_page(fitz.Rect(0, expected_bleed_pt+page_h_pt, expected_bleed_pt, new_h),
+                               doc, 0, clip=fitz.Rect(0, bot_src_y, expected_bleed_pt, page_h_pt))
+        # Unten-rechts
+        new_page.show_pdf_page(fitz.Rect(expected_bleed_pt+page_w_pt, expected_bleed_pt+page_h_pt, new_w, new_h),
+                               doc, 0, clip=fitz.Rect(right_src_x, bot_src_y, page_w_pt, page_h_pt))
+
+        pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
+        new_doc.close()
+        fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
+        if not fixes_applied or fixes_applied == ["Beschnittzeichen entfernt"]:
+            pass
+        return pdf_bytes, fixes_applied
 
     pdf_bytes = doc.tobytes(garbage=4, deflate=True)
 
@@ -710,7 +793,7 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.2.3"}
+    return {"status": "ok", "service": "PPS API", "version": "1.3.0"}
 
 if __name__ == "__main__":
     import uvicorn
