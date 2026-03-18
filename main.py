@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.3.3
+Backend API · Version 1.3.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.3.3")
+app = FastAPI(title="PPS API", version="1.3.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -735,7 +735,20 @@ def load_users() -> dict:
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
-            _users_cache = data.get("record", {}).get("users", {})
+            record = data.get("record", {})
+            users_raw = record.get("users", {})
+            # Kompatibilität: Array-Format → Dict konvertieren
+            if isinstance(users_raw, list):
+                users_dict = {}
+                for u in users_raw:
+                    if "email" in u and "name" in u:
+                        users_dict[u["email"]] = {
+                            "name": u["name"],
+                            "password": u.get("password", "")
+                        }
+                _users_cache = users_dict
+            else:
+                _users_cache = users_raw
             _cache_loaded = True
     except Exception:
         pass
@@ -755,12 +768,17 @@ def save_users(users: dict):
             method="PUT",
             headers={
                 "Content-Type": "application/json",
-                "X-Master-Key": JSONBIN_KEY
+                "X-Master-Key": JSONBIN_KEY,
+                "X-Bin-Private": "true"
             }
         )
-        urllib.request.urlopen(req, timeout=5)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pass  # OK
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise HTTPException(500, f"JSONBin Fehler {e.code}: {body}")
     except Exception as e:
-        raise HTTPException(500, f"Speichern fehlgeschlagen: {e}")
+        raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
 
 # ─────────────────────────────────────────────
 #  AUTH ENDPOINTS
@@ -831,7 +849,7 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.3.3"}
+    return {"status": "ok", "service": "PPS API", "version": "1.3.5"}
 
 if __name__ == "__main__":
     import uvicorn
