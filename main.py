@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.5
+Backend API · Version 1.5.1
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -628,16 +628,25 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         expected_bleed_pt = expected_bleed_mm / PT_TO_MM
 
         page = doc[0]
-        rect = page.rect
-        W = rect.width   # Seitenbreite in pt
-        H = rect.height  # Seitenhöhe in pt
-        B = expected_bleed_pt  # Beschnitt in pt
 
-        # Seite als Pixmap rendern (300 DPI für Qualität)
+        # Nur den TrimBox-Bereich rendern (OHNE Beschnittzeichen außen)
+        trimbox = page.trimbox
+        mediabox = page.mediabox
+        if trimbox and trimbox != mediabox:
+            # Clip auf TrimBox bevor wir rendern
+            clip_rect = trimbox
+        else:
+            clip_rect = page.rect
+
+        W = clip_rect.width
+        H = clip_rect.height
+        B = expected_bleed_pt
+
         dpi = 150
         scale_factor = dpi / 72.0
         mat = fitz.Matrix(scale_factor, scale_factor)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
+        # Pixmap nur vom TrimBox-Bereich
+        pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip_rect)
 
         pw = pix.width   # Pixmap-Breite
         ph = pix.height  # Pixmap-Höhe
@@ -864,7 +873,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.5.0"}
+    return {"status": "ok", "service": "PPS API", "version": "1.5.1"}
 
 if __name__ == "__main__":
     import uvicorn
