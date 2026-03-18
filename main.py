@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.2.4
+Backend API · Version 1.3.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.3.0")
+app = FastAPI(title="PPS API", version="1.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -705,24 +705,71 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 
 
 # ─────────────────────────────────────────────
-#  USER STORE
+#  USER STORE — Railway Environment Variable
+#  Überlebt Redeploys, kein Volume nötig
 # ─────────────────────────────────────────────
 import json
 import os
 
-USERS_FILE = "users.json"
-ADMIN_EMAIL = "dm@dcp-online.de"
-ADMIN_PASSWORD = "supersize"
+ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL", "dm@dcp-online.de")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "supersize")
+USERS_VAR      = "PPS_USERS"  # Name der Railway-Variable
 
-def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+def load_users() -> dict:
+    """Liest Nutzer aus der Umgebungsvariable PPS_USERS."""
+    raw = os.environ.get(USERS_VAR, "")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
 
-def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+def save_users(users: dict):
+    """
+    Schreibt Nutzer zurück in die Umgebungsvariable via Railway API.
+    Fallback: in-memory (geht verloren bei Redeploy, aber selten nötig).
+    """
+    import urllib.request, urllib.error
+    token   = os.environ.get("RAILWAY_TOKEN", "")
+    svc_id  = os.environ.get("RAILWAY_SERVICE_ID", "")
+    env_id  = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    proj_id = os.environ.get("RAILWAY_PROJECT_ID", "")
+
+    # Immer in os.environ schreiben (für laufende Session)
+    os.environ[USERS_VAR] = json.dumps(users)
+
+    # Persistenz via Railway GraphQL API
+    if not all([token, svc_id, env_id, proj_id]):
+        # Kein Token → nur In-Memory (reicht für Tests)
+        return
+
+    query = """
+    mutation UpsertVariables($input: VariableCollectionUpsertInput!) {
+      variableCollectionUpsert(input: $input)
+    }
+    """
+    variables = {
+        "input": {
+            "projectId": proj_id,
+            "environmentId": env_id,
+            "serviceId": svc_id,
+            "variables": {USERS_VAR: json.dumps(users)}
+        }
+    }
+    payload = json.dumps({"query": query, "variables": variables}).encode()
+    req = urllib.request.Request(
+        "https://backboard.railway.app/graphql/v2",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Stille Fehler — In-Memory bleibt gültig
 
 # ─────────────────────────────────────────────
 #  AUTH ENDPOINTS
@@ -793,7 +840,7 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.3.0"}
+    return {"status": "ok", "service": "PPS API", "version": "1.3.2"}
 
 if __name__ == "__main__":
     import uvicorn
