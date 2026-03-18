@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.2
+Backend API · Version 1.6.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -75,10 +75,16 @@ async def fix_pdf(
     except Exception:
         raise HTTPException(422, "PDF konnte nicht geöffnet werden.")
 
-    # Upscaling vor dem Bleed-Fix (damit Randspiegelung mit hochgerechneten Bildern arbeitet)
     upscaled_count = 0
+    upscaled_bytes = None
+
     if fix_resolution:
-        doc, upscaled_count = upscale_images_in_pdf(doc, scale)
+        upscaled_bytes, upscaled_count = upscale_images_in_pdf(doc, scale)
+
+    # Wenn upscaling durchgeführt: mit neuem Dokument weiterarbeiten
+    if upscaled_bytes:
+        doc.close()
+        doc = fitz.open(stream=upscaled_bytes, filetype="pdf")
 
     fixed_pdf, fixes_applied = apply_fixes(
         doc, data, print_width_mm, print_height_mm, scale,
@@ -87,7 +93,7 @@ async def fix_pdf(
     doc.close()
 
     if upscaled_count > 0:
-        fixes_applied.append(f"{upscaled_count} Bild(er) hochgerechnet (Lanczos 2x)")
+        fixes_applied.append(f"{upscaled_count} Bild(er) hochgerechnet (Lanczos)")
 
     filename = file.filename.replace(".pdf", "") + "_PPS_fixed.pdf"
     return Response(
@@ -607,9 +613,11 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
 # ─────────────────────────────────────────────
 def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     """
-    Findet alle Bilder unter min_dpi_1to1 und rechnet sie hoch.
-    Strategie: Bild extrahieren, hochrechnen, alten xref-Stream ersetzen
-    UND Width/Height im PDF-Dictionary korrigieren.
+    Hochrechnen via neues Dokument:
+    1. Originaldokument als Hintergrund rendern
+    2. Bilder die upscaling brauchen einzeln hochrechnen
+    3. Hochgerechnete Bilder über den Hintergrund legen
+    Gibt (new_pdf_bytes, count) zurück statt modifiziertem doc.
     """
     from PIL import Image
     import io as _io
@@ -617,8 +625,9 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
 
     page = doc[0]
     image_list = page.get_images(full=True)
-    upscaled_count = 0
 
+    # Sammle alle Bilder die upscaling brauchen
+    to_upscale = []
     for img_info in image_list:
         xref = img_info[0]
         try:
@@ -628,7 +637,6 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             img_bytes = base_image["image"]
             colorspace = base_image.get("colorspace", 3)
 
-            # Effektive DPI berechnen
             img_rects = page.get_image_rects(xref)
             if not img_rects:
                 continue
@@ -644,53 +652,68 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             )
             dpi_1to1 = dpi_doc / scale
 
-            if dpi_1to1 >= min_dpi_1to1:
+            if dpi_1to1 >= min_dpi_1to1 or dpi_1to1 < 25.0:
                 continue
-            if dpi_1to1 < 25.0:
-                continue  # Zu niedrig für sinnvolles Upscaling
 
-            # Upscale-Faktor
             factor = min(min_dpi_1to1 / dpi_1to1, 4.0)
-            new_w = int(img_w_px * factor)
-            new_h = int(img_h_px * factor)
+            to_upscale.append({
+                "xref": xref,
+                "rect": r,
+                "bytes": img_bytes,
+                "w": img_w_px,
+                "h": img_h_px,
+                "factor": factor,
+                "dpi_1to1": dpi_1to1,
+                "colorspace": colorspace,
+            })
+        except Exception as e:
+            print(f"[PPS] upscale scan error xref={xref}: {e}", file=sys.stderr)
 
-            # Bild hochrechnen
-            img = Image.open(_io.BytesIO(img_bytes))
-            if img.mode not in ('RGB', 'CMYK', 'L'):
+    if not to_upscale:
+        return None, 0
+
+    # Neues Dokument aufbauen
+    new_doc = fitz.open()
+    rect = page.rect
+    new_page = new_doc.new_page(width=rect.width, height=rect.height)
+
+    # Original als Hintergrund
+    new_page.show_pdf_page(rect, doc, 0)
+
+    # Hochgerechnete Bilder drüberlegen
+    upscaled_count = 0
+    for item in to_upscale:
+        try:
+            img = Image.open(_io.BytesIO(item["bytes"]))
+            if img.mode not in ('RGB', 'CMYK', 'L', 'RGBA'):
                 img = img.convert('RGB')
+
+            new_w = int(item["w"] * item["factor"])
+            new_h = int(item["h"] * item["factor"])
             img_up = img.resize((new_w, new_h), Image.LANCZOS)
 
             out_buf = _io.BytesIO()
+            # PNG für verlustfreie Einbettung (kein Korruptionsrisiko)
             if img.mode == 'CMYK':
-                img_up.save(out_buf, format="JPEG", quality=95)
-            else:
-                img_up.save(out_buf, format="JPEG", quality=95)
-            new_bytes = out_buf.getvalue()
+                img_up = img_up.convert('RGB')
+            img_up.save(out_buf, format="PNG")
+            up_bytes = out_buf.getvalue()
 
-            # Stream ersetzen — das ist der zuverlässige Weg
-            # update_stream ersetzt den Bildinhalt
-            doc.update_stream(xref, new_bytes)
-
-            # Width und Height im XObject-Dictionary direkt setzen
-            # Das ist kritisch damit PDF-Reader die richtige Auflösung kennt
-            doc.xref_set_key(xref, "Width", f"{new_w}")
-            doc.xref_set_key(xref, "Height", f"{new_h}")
-            doc.xref_set_key(xref, "Filter", "/DCTDecode")
-            # BitsPerComponent und ColorSpace beibehalten
-            # Die Transformation-Matrix auf der Seite bleibt unverändert
-            # → gleiche Platzierung, aber mehr Pixel = höhere DPI
+            place_rect = fitz.Rect(item["rect"].x0, item["rect"].y0,
+                                   item["rect"].x1, item["rect"].y1)
+            new_page.insert_image(place_rect, stream=up_bytes)
 
             upscaled_count += 1
-            new_dpi_1to1 = dpi_1to1 * factor
-            print(f"[PPS] upscaled xref={xref}: {img_w_px}x{img_h_px}→{new_w}x{new_h} "
-                  f"| {dpi_1to1:.0f}→{new_dpi_1to1:.0f} DPI@1:1 | factor={factor:.1f}x",
-                  file=sys.stderr)
+            new_dpi = item["dpi_1to1"] * item["factor"]
+            print(f"[PPS] upscaled: {item['w']}x{item['h']}→{new_w}x{new_h} "
+                  f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} DPI@1:1", file=sys.stderr)
 
         except Exception as e:
-            print(f"[PPS] upscale error xref={xref}: {e}", file=sys.stderr)
-            continue
+            print(f"[PPS] upscale apply error: {e}", file=sys.stderr)
 
-    return doc, upscaled_count
+    pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
+    new_doc.close()
+    return pdf_bytes, upscaled_count
 
 
 # ─────────────────────────────────────────────
@@ -1050,7 +1073,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.2"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.3"}
 
 if __name__ == "__main__":
     import uvicorn
