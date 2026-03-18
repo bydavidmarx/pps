@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.4.2
+Backend API · Version 1.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -705,20 +705,20 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 
 
 # ─────────────────────────────────────────────
-#  USER STORE — In-Memory + KV-Store via kvdb.io
-#  Kostenlos, kein Setup, persistent
+#  USER STORE — Upstash Redis REST API
+#  Kostenlos, persistent, keine Verifizierung nötig
 # ─────────────────────────────────────────────
 import json
 import os
 import urllib.request
 import urllib.error
+import urllib.parse
 
 ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL", "dm@dcp-online.de")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "supersize")
-KV_BUCKET      = os.environ.get("KV_BUCKET", "")   # kvdb.io bucket ID
-KV_URL         = f"https://kvdb.io/{KV_BUCKET}/pps_users"
+UPSTASH_URL    = os.environ.get("UPSTASH_URL", "").rstrip("/")
+UPSTASH_TOKEN  = os.environ.get("UPSTASH_TOKEN", "")
 
-# In-Memory für laufende Session
 _users: dict = {}
 _loaded: bool = False
 
@@ -726,13 +726,18 @@ def load_users() -> dict:
     global _users, _loaded
     if _loaded:
         return _users
-    if not KV_BUCKET:
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
         _loaded = True
         return _users
     try:
-        req = urllib.request.Request(KV_URL)
+        url = f"{UPSTASH_URL}/get/pps_users"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            raw = resp.read().decode()
+            data = json.loads(resp.read())
+            raw = data.get("result")
             if raw:
                 _users = json.loads(raw)
     except Exception:
@@ -744,27 +749,25 @@ def save_users(users: dict):
     global _users, _loaded
     _users = users
     _loaded = True
-    if not KV_BUCKET:
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
         return
-    import sys
-    print(f"[PPS] save_users: bucket={KV_BUCKET}, url={KV_URL}", file=sys.stderr)
     try:
-        payload = json.dumps(users).encode()
+        payload = json.dumps(users)
+        url = f"{UPSTASH_URL}/set/pps_users"
         req = urllib.request.Request(
-            KV_URL,
-            data=payload,
-            method="PUT",
-            headers={"Content-Type": "application/json"}
+            url,
+            data=payload.encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {UPSTASH_TOKEN}",
+                "Content-Type": "application/json"
+            }
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = resp.read().decode()
-            print(f"[PPS] save_users: OK - {result}", file=sys.stderr)
+        urllib.request.urlopen(req, timeout=10)
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        print(f"[PPS] save_users: HTTPError {e.code} - {body}", file=sys.stderr)
-        raise HTTPException(500, f"KV Fehler {e.code}: {body}")
+        raise HTTPException(500, f"Upstash Fehler {e.code}: {body}")
     except Exception as e:
-        print(f"[PPS] save_users: Exception - {str(e)}", file=sys.stderr)
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
 
 # ─────────────────────────────────────────────
@@ -834,17 +837,21 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
-@app.get("/debug/kv")
-def debug_kv():
-    bucket = os.environ.get("KV_BUCKET", "")
-    if not bucket:
-        return {"error": "KV_BUCKET nicht gesetzt"}
-    url = f"https://kvdb.io/{bucket}/pps_users"
+@app.get("/debug/store")
+def debug_store():
+    upstash_url = os.environ.get("UPSTASH_URL", "")
+    upstash_token = os.environ.get("UPSTASH_TOKEN", "")
+    if not upstash_url or not upstash_token:
+        return {"error": "UPSTASH_URL oder UPSTASH_TOKEN nicht gesetzt"}
     try:
-        req = urllib.request.Request(url)
+        url = f"{upstash_url.rstrip('/')}/get/pps_users"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {upstash_token}"}
+        )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            raw = resp.read().decode()
-            return {"status": "ok", "data": raw}
+            data = json.loads(resp.read())
+            return {"status": "ok", "result": data.get("result")}
     except urllib.error.HTTPError as e:
         return {"error": f"HTTP {e.code}", "body": e.read().decode()}
     except Exception as e:
@@ -852,7 +859,7 @@ def debug_kv():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.4.1"}
+    return {"status": "ok", "service": "PPS API", "version": "1.4.2"}
 
 if __name__ == "__main__":
     import uvicorn
