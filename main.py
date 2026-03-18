@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.4
+Backend API · Version 1.6.8
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -699,31 +699,33 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             img_up.save(out_buf, format="JPEG", quality=95)
             new_jpeg = out_buf.getvalue()
 
-            # Finde das XObject das diesem Bild entspricht (nach Größe)
+            # Alle XObjects loggen zum Debuggen
+            print(f"[PPS] looking for image {item['w']}x{item['h']} in {len(list(xobjects.keys()))} xobjects", file=sys.stderr)
             for name in list(xobjects.keys()):
                 try:
                     obj = xobjects[name]
-                    obj_w = int(obj.get("/Width", 0))
-                    obj_h = int(obj.get("/Height", 0))
+                    obj_w = int(str(obj.get("/Width", "0")))
+                    obj_h = int(str(obj.get("/Height", "0")))
+                    print(f"[PPS]   xobj '{name}': {obj_w}x{obj_h}", file=sys.stderr)
                     if obj_w == item["w"] and obj_h == item["h"]:
-                        # Ersetze Stream und Metadaten
                         cs = obj.get("/ColorSpace", pikepdf.Name("/DeviceRGB"))
+                        # Schreibe neuen Stream
                         obj.stream_data = new_jpeg
-                        obj["/Width"] = pikepdf.Integer(new_w)
-                        obj["/Height"] = pikepdf.Integer(new_h)
+                        obj["/Width"] = pikepdf.objects.Integer(new_w)
+                        obj["/Height"] = pikepdf.objects.Integer(new_h)
                         obj["/Filter"] = pikepdf.Name("/DCTDecode")
                         obj["/ColorSpace"] = cs
-                        obj["/BitsPerComponent"] = pikepdf.Integer(8)
-                        # Entferne alte Filter falls vorhanden
-                        if "/DecodeParms" in obj:
-                            del obj["/DecodeParms"]
+                        obj["/BitsPerComponent"] = pikepdf.objects.Integer(8)
+                        for key in ["/DecodeParms", "/Length", "/SMask"]:
+                            if key in obj:
+                                del obj[key]
                         upscaled_count += 1
                         new_dpi = item["dpi_1to1"] * item["factor"]
-                        print(f"[PPS] replaced '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
+                        print(f"[PPS] REPLACED '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
                               f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} DPI@1:1", file=sys.stderr)
                         break
                 except Exception as xe:
-                    print(f"[PPS] xobj check error {name}: {xe}", file=sys.stderr)
+                    print(f"[PPS] xobj error {name}: {xe}", file=sys.stderr)
                     continue
 
         except Exception as e:
@@ -1092,7 +1094,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.6"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.8"}
 
 if __name__ == "__main__":
     import uvicorn
