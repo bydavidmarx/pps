@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.1
+Backend API · Version 1.6.2
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -42,8 +42,8 @@ async def analyze(
         raise HTTPException(400, "Nur PDF-Dateien erlaubt.")
 
     data = await file.read()
-    if len(data) > 50 * 1024 * 1024:
-        raise HTTPException(413, "Datei zu groß (max. 50 MB).")
+    if len(data) > 100 * 1024 * 1024:
+        raise HTTPException(413, "Datei zu groß (max. 100 MB).")
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -607,12 +607,13 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
 # ─────────────────────────────────────────────
 def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     """
-    Findet alle Bilder unter min_dpi_1to1 und verdoppelt deren Auflösung
-    mit Lanczos-Resampling. Setzt sie an exakt gleicher Position ein.
-    Gibt (modified_doc, count) zurück.
+    Findet alle Bilder unter min_dpi_1to1 und rechnet sie hoch.
+    Strategie: Bild extrahieren, hochrechnen, alten xref-Stream ersetzen
+    UND Width/Height im PDF-Dictionary korrigieren.
     """
     from PIL import Image
     import io as _io
+    import sys
 
     page = doc[0]
     image_list = page.get_images(full=True)
@@ -625,10 +626,9 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             img_w_px = base_image["width"]
             img_h_px = base_image["height"]
             img_bytes = base_image["image"]
-            img_ext = base_image["ext"]
             colorspace = base_image.get("colorspace", 3)
 
-            # Berechne effektive DPI
+            # Effektive DPI berechnen
             img_rects = page.get_image_rects(xref)
             if not img_rects:
                 continue
@@ -644,58 +644,49 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             )
             dpi_1to1 = dpi_doc / scale
 
-            # Nur Bilder unter Minimum hochrechnen
             if dpi_1to1 >= min_dpi_1to1:
                 continue
-            # Bilder unter 25 DPI (1:1) sind zu schlecht — kein Upscaling
             if dpi_1to1 < 25.0:
-                continue
+                continue  # Zu niedrig für sinnvolles Upscaling
 
-            # Faktor berechnen: auf Ziel-DPI bringen
-            target_dpi_1to1 = min_dpi_1to1
-            factor = target_dpi_1to1 / dpi_1to1
-            # Maximal 4x hochrechnen
-            factor = min(factor, 4.0)
+            # Upscale-Faktor
+            factor = min(min_dpi_1to1 / dpi_1to1, 4.0)
             new_w = int(img_w_px * factor)
             new_h = int(img_h_px * factor)
 
-            # Bild laden und hochrechnen
+            # Bild hochrechnen
             img = Image.open(_io.BytesIO(img_bytes))
+            if img.mode not in ('RGB', 'CMYK', 'L'):
+                img = img.convert('RGB')
+            img_up = img.resize((new_w, new_h), Image.LANCZOS)
 
-            # CMYK korrekt behandeln
+            out_buf = _io.BytesIO()
             if img.mode == 'CMYK':
-                img_up = img.resize((new_w, new_h), Image.LANCZOS)
-                out_buf = _io.BytesIO()
-                img_up.save(out_buf, format="JPEG", quality=92)
-            elif img.mode in ('RGB', 'L'):
-                img_up = img.resize((new_w, new_h), Image.LANCZOS)
-                out_buf = _io.BytesIO()
-                img_up.save(out_buf, format="JPEG", quality=92)
+                img_up.save(out_buf, format="JPEG", quality=95)
             else:
-                img_up = img.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
-                out_buf = _io.BytesIO()
-                img_up.save(out_buf, format="JPEG", quality=92)
+                img_up.save(out_buf, format="JPEG", quality=95)
+            new_bytes = out_buf.getvalue()
 
-            new_img_bytes = out_buf.getvalue()
+            # Stream ersetzen — das ist der zuverlässige Weg
+            # update_stream ersetzt den Bildinhalt
+            doc.update_stream(xref, new_bytes)
 
-            # Bild korrekt ersetzen via insert_image
-            # Erst altes Bild aus Seite entfernen, dann neues einfügen
-            img_buf = _io.BytesIO(new_img_bytes)
-
-            # Platzierungsrechteck aus der Seite holen
-            place_rect = fitz.Rect(r.x0, r.y0, r.x1, r.y1)
-
-            # Neues Bild einfügen an gleicher Position
-            page.insert_image(place_rect, stream=new_img_bytes, xref=xref)
+            # Width und Height im XObject-Dictionary direkt setzen
+            # Das ist kritisch damit PDF-Reader die richtige Auflösung kennt
+            doc.xref_set_key(xref, "Width", f"{new_w}")
+            doc.xref_set_key(xref, "Height", f"{new_h}")
+            doc.xref_set_key(xref, "Filter", "/DCTDecode")
+            # BitsPerComponent und ColorSpace beibehalten
+            # Die Transformation-Matrix auf der Seite bleibt unverändert
+            # → gleiche Platzierung, aber mehr Pixel = höhere DPI
 
             upscaled_count += 1
-            import sys
-            print(f"[PPS] upscaled xref={xref}: {img_w_px}x{img_h_px} → {new_w}x{new_h} "
-                  f"({dpi_1to1:.1f} → {dpi_1to1*factor:.1f} DPI@1:1, factor={factor:.1f}x)",
+            new_dpi_1to1 = dpi_1to1 * factor
+            print(f"[PPS] upscaled xref={xref}: {img_w_px}x{img_h_px}→{new_w}x{new_h} "
+                  f"| {dpi_1to1:.0f}→{new_dpi_1to1:.0f} DPI@1:1 | factor={factor:.1f}x",
                   file=sys.stderr)
 
         except Exception as e:
-            import sys
             print(f"[PPS] upscale error xref={xref}: {e}", file=sys.stderr)
             continue
 
@@ -1059,7 +1050,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.1"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.2"}
 
 if __name__ == "__main__":
     import uvicorn
