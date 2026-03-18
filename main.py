@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.5.3
+Backend API · Version 1.5.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -604,61 +604,82 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
 def _estimate_trim_area(page, mediabox):
     """
     Bestimme den echten Druckbereich ohne TrimBox.
-    Strategie: Finde den kleinsten Bounding-Box aller Bild-Inhalte
-    und nutze das als TrimBox-Schätzung.
-    Alternativ: Finde die äußersten Beschnittzeichen-Koordinaten
-    und leite daraus die TrimBox ab.
+    Neue Strategie: Pixel-basierte Analyse — rendere die Seite
+    und finde wo die weißen Ränder (Beschnittzeichen-Bereich) enden.
     """
     import sys
-    paths = page.get_drawings()
+    from PIL import Image
+    import io as _io
 
-    # Sammle alle dünnen Linien die außerhalb des Hauptbereichs liegen
-    # Beschnittzeichen haben typisch: width < 1pt, Länge 3-15mm
-    thin_lines = []
-    for p in paths:
-        r = p.get("rect")
-        if r is None:
-            continue
-        stroke_w = float(p.get("width") or 1.0)
-        if stroke_w > 1.5:
-            continue
-        rect_w = abs(r.x1 - r.x0) * PT_TO_MM
-        rect_h = abs(r.y1 - r.y0) * PT_TO_MM
-        # Typische Beschnittzeichen: sehr kurz in einer Dimension
-        if rect_w < 0.5 or rect_h < 0.5:
-            thin_lines.append(r)
+    # Seite mit niedriger Auflösung rendern für schnelle Analyse
+    mat = fitz.Matrix(0.5, 0.5)  # 36 DPI — nur für Positionsanalyse
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-    if not thin_lines:
-        return mediabox
+    w, h = img.size
 
-    # Finde die innersten Koordinaten der Beschnittzeichen
-    # Das ergibt uns die TrimBox-Ecken
-    # Beschnittzeichen zeigen NACH INNEN → die inneren Enden definieren die TrimBox
+    # Analysiere Zeilen/Spalten auf weiße/fast-weiße Pixel
+    # Beschnittzeichen-Bereich hat sehr hellen Hintergrund
+    # Druckinhalt beginnt wo Pixel deutlich dunkler werden
 
-    # Sortiere nach Position
-    left_lines   = [r for r in thin_lines if (r.x0 - mediabox.x0) * PT_TO_MM < 15]
-    right_lines  = [r for r in thin_lines if (mediabox.x1 - r.x1) * PT_TO_MM < 15]
-    top_lines    = [r for r in thin_lines if (r.y0 - mediabox.y0) * PT_TO_MM < 15]
-    bottom_lines = [r for r in thin_lines if (mediabox.y1 - r.y1) * PT_TO_MM < 15]
+    def is_margin_row(y, threshold=245):
+        """True wenn Zeile fast komplett weiß ist (Beschnittzeichen-Bereich)"""
+        pixels = [img.getpixel((x, y)) for x in range(0, w, max(1, w//20))]
+        bright = sum(1 for p in pixels if all(c > threshold for c in p))
+        return bright > len(pixels) * 0.85
 
-    # Berechne TrimBox aus den innersten Punkten der Cropmarks
-    x0 = max((r.x1 for r in left_lines), default=mediabox.x0)
-    x1 = min((r.x0 for r in right_lines), default=mediabox.x1)
-    y0 = max((r.y1 for r in top_lines), default=mediabox.y0)
-    y1 = min((r.y0 for r in bottom_lines), default=mediabox.y1)
+    def is_margin_col(x, threshold=245):
+        pixels = [img.getpixel((x, y)) for y in range(0, h, max(1, h//20))]
+        bright = sum(1 for p in pixels if all(c > threshold for c in p))
+        return bright > len(pixels) * 0.85
 
-    print(f"[PPS] estimate_trim: x0={x0:.1f} y0={y0:.1f} x1={x1:.1f} y1={y1:.1f}", file=sys.stderr)
-    print(f"[PPS] mediabox: x0={mediabox.x0:.1f} y0={mediabox.y0:.1f} x1={mediabox.x1:.1f} y1={mediabox.y1:.1f}", file=sys.stderr)
-    print(f"[PPS] thin_lines: {len(thin_lines)}, left:{len(left_lines)} right:{len(right_lines)} top:{len(top_lines)} bot:{len(bottom_lines)}", file=sys.stderr)
+    # Finde wo der Inhalt beginnt (von außen nach innen)
+    top_margin = 0
+    for y in range(min(int(h * 0.15), 30)):
+        if is_margin_row(y):
+            top_margin = y + 1
+        else:
+            break
 
-    # Validierung: TrimBox muss sinnvoll sein
+    bottom_margin = 0
+    for y in range(h - 1, max(int(h * 0.85), h - 30), -1):
+        if is_margin_row(y):
+            bottom_margin = h - y
+        else:
+            break
+
+    left_margin = 0
+    for x in range(min(int(w * 0.15), 30)):
+        if is_margin_col(x):
+            left_margin = x + 1
+        else:
+            break
+
+    right_margin = 0
+    for x in range(w - 1, max(int(w * 0.85), w - 30), -1):
+        if is_margin_col(x):
+            right_margin = w - x
+        else:
+            break
+
+    print(f"[PPS] pixel margins: top={top_margin} bot={bottom_margin} left={left_margin} right={right_margin} (at 0.5x)", file=sys.stderr)
+
+    # Konvertiere Pixel-Margins zurück in PDF-Punkte (factor 2 wegen 0.5x Scale)
+    scale_back = 2.0
+    x0 = mediabox.x0 + left_margin * scale_back
+    y0 = mediabox.y0 + top_margin * scale_back
+    x1 = mediabox.x1 - right_margin * scale_back
+    y1 = mediabox.y1 - bottom_margin * scale_back
+
+    # Validierung
     if x0 >= x1 or y0 >= y1:
+        print(f"[PPS] estimate_trim: invalid, using mediabox", file=sys.stderr)
         return mediabox
-    if (x1 - x0) < mediabox.width * 0.5:
-        return mediabox  # zu viel abgeschnitten
-    if (y1 - y0) < mediabox.height * 0.5:
+    if (x1 - x0) < mediabox.width * 0.6:
+        print(f"[PPS] estimate_trim: too much cropped, using mediabox", file=sys.stderr)
         return mediabox
 
+    print(f"[PPS] estimate_trim result: {(x1-x0)*PT_TO_MM:.1f}x{(y1-y0)*PT_TO_MM:.1f}mm", file=sys.stderr)
     return fitz.Rect(x0, y0, x1, y1)
 
 
@@ -937,7 +958,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.5.3"}
+    return {"status": "ok", "service": "PPS API", "version": "1.5.4"}
 
 if __name__ == "__main__":
     import uvicorn
