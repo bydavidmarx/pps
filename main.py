@@ -672,20 +672,23 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     if not to_upscale:
         return None, 0
 
-    # Neues Dokument aufbauen
-    new_doc = fitz.open()
-    rect = page.rect
-    new_page = new_doc.new_page(width=rect.width, height=rect.height)
+    import pikepdf
+    import io as _io2
+    import sys
 
-    # Original als Hintergrund
-    new_page.show_pdf_page(rect, doc, 0)
-
-    # Hochgerechnete Bilder drüberlegen
     upscaled_count = 0
+    pdf_bytes_orig = doc.tobytes()
+    pdf_pk = pikepdf.open(_io2.BytesIO(pdf_bytes_orig))
+    page_pk = pdf_pk.pages[0]
+
+    # Hole alle XObjects der Seite
+    resources = page_pk.Resources
+    xobjects = resources.get("/XObject", {})
+
     for item in to_upscale:
         try:
             img = Image.open(_io.BytesIO(item["bytes"]))
-            if img.mode not in ('RGB', 'CMYK', 'L', 'RGBA'):
+            if img.mode not in ('RGB', 'CMYK', 'L'):
                 img = img.convert('RGB')
 
             new_w = int(item["w"] * item["factor"])
@@ -693,29 +696,43 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             img_up = img.resize((new_w, new_h), Image.LANCZOS)
 
             out_buf = _io.BytesIO()
-            if img.mode == 'CMYK':
-                # CMYK als JPEG behalten — KEINE RGB-Konvertierung
-                # RGB-Konvertierung invertiert CMYK-Farben
-                img_up.save(out_buf, format="JPEG", quality=95)
-            else:
-                img_up.save(out_buf, format="PNG")
-            up_bytes = out_buf.getvalue()
+            img_up.save(out_buf, format="JPEG", quality=95)
+            new_jpeg = out_buf.getvalue()
 
-            place_rect = fitz.Rect(item["rect"].x0, item["rect"].y0,
-                                   item["rect"].x1, item["rect"].y1)
-            new_page.insert_image(place_rect, stream=up_bytes)
-
-            upscaled_count += 1
-            new_dpi = item["dpi_1to1"] * item["factor"]
-            print(f"[PPS] upscaled: {item['w']}x{item['h']}→{new_w}x{new_h} "
-                  f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} DPI@1:1", file=sys.stderr)
+            # Finde das XObject das diesem Bild entspricht (nach Größe)
+            for name in list(xobjects.keys()):
+                try:
+                    obj = xobjects[name]
+                    obj_w = int(obj.get("/Width", 0))
+                    obj_h = int(obj.get("/Height", 0))
+                    if obj_w == item["w"] and obj_h == item["h"]:
+                        # Ersetze Stream und Metadaten
+                        cs = obj.get("/ColorSpace", pikepdf.Name("/DeviceRGB"))
+                        obj.stream_data = new_jpeg
+                        obj["/Width"] = pikepdf.Integer(new_w)
+                        obj["/Height"] = pikepdf.Integer(new_h)
+                        obj["/Filter"] = pikepdf.Name("/DCTDecode")
+                        obj["/ColorSpace"] = cs
+                        obj["/BitsPerComponent"] = pikepdf.Integer(8)
+                        # Entferne alte Filter falls vorhanden
+                        if "/DecodeParms" in obj:
+                            del obj["/DecodeParms"]
+                        upscaled_count += 1
+                        new_dpi = item["dpi_1to1"] * item["factor"]
+                        print(f"[PPS] replaced '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
+                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} DPI@1:1", file=sys.stderr)
+                        break
+                except Exception as xe:
+                    print(f"[PPS] xobj check error {name}: {xe}", file=sys.stderr)
+                    continue
 
         except Exception as e:
-            print(f"[PPS] upscale apply error: {e}", file=sys.stderr)
+            print(f"[PPS] upscale item error: {e}", file=sys.stderr)
 
-    pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
-    new_doc.close()
-    return pdf_bytes, upscaled_count
+    out = _io2.BytesIO()
+    pdf_pk.save(out)
+    pdf_pk.close()
+    return out.getvalue(), upscaled_count
 
 
 # ─────────────────────────────────────────────
@@ -1075,7 +1092,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.4"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.6"}
 
 if __name__ == "__main__":
     import uvicorn
