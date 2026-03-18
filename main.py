@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.4
+Backend API · Version 1.5
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -627,73 +627,78 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         expected_bleed_mm = 20.0 / scale
         expected_bleed_pt = expected_bleed_mm / PT_TO_MM
 
-        # Aktuellen Druckbereich holen (nach Crop-Schritt)
         page = doc[0]
         rect = page.rect
-        page_w_pt = rect.width
-        page_h_pt = rect.height
+        W = rect.width   # Seitenbreite in pt
+        H = rect.height  # Seitenhöhe in pt
+        B = expected_bleed_pt  # Beschnitt in pt
 
-        # Neues Dokument mit erweiterter Seite
-        new_doc = fitz.open()
-        new_w = page_w_pt + 2 * expected_bleed_pt
-        new_h = page_h_pt + 2 * expected_bleed_pt
-        new_page = new_doc.new_page(width=new_w, height=new_h)
+        # Seite als Pixmap rendern (300 DPI für Qualität)
+        dpi = 150
+        scale_factor = dpi / 72.0
+        mat = fitz.Matrix(scale_factor, scale_factor)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
 
-        # Originalen Inhalt in die Mitte einbetten
-        src_rect = fitz.Rect(0, 0, page_w_pt, page_h_pt)
-        dst_rect = fitz.Rect(expected_bleed_pt, expected_bleed_pt,
-                             expected_bleed_pt + page_w_pt,
-                             expected_bleed_pt + page_h_pt)
-        new_page.show_pdf_page(dst_rect, doc, 0)
+        pw = pix.width   # Pixmap-Breite
+        ph = pix.height  # Pixmap-Höhe
+        bx = int(B * scale_factor)  # Beschnitt in Pixel
 
-        # Randspiegelung — vier Seiten
-        # Links (gespiegelt horizontal)
-        left_src = fitz.Rect(0, 0, expected_bleed_pt, page_h_pt)
-        left_dst = fitz.Rect(0, expected_bleed_pt, expected_bleed_pt,
-                             expected_bleed_pt + page_h_pt)
-        new_page.show_pdf_page(left_dst, doc, 0,
-                               clip=fitz.Rect(0, 0, expected_bleed_pt, page_h_pt),
-                               rotate=0)
+        # PIL für Spiegelung nutzen
+        from PIL import Image
+        import io as _io
 
-        # Rechts (gespiegelt horizontal)
-        right_src_x = page_w_pt - expected_bleed_pt
-        right_dst = fitz.Rect(expected_bleed_pt + page_w_pt, expected_bleed_pt,
-                              new_w, expected_bleed_pt + page_h_pt)
-        new_page.show_pdf_page(right_dst, doc, 0,
-                               clip=fitz.Rect(right_src_x, 0, page_w_pt, page_h_pt))
+        img = Image.frombytes("RGB", (pw, ph), pix.samples)
 
-        # Oben (gespiegelt vertikal)
-        top_dst = fitz.Rect(expected_bleed_pt, 0,
-                            expected_bleed_pt + page_w_pt, expected_bleed_pt)
-        new_page.show_pdf_page(top_dst, doc, 0,
-                               clip=fitz.Rect(0, 0, page_w_pt, expected_bleed_pt))
+        # Neue Bildgröße mit Beschnitt
+        nw = pw + 2 * bx
+        nh = ph + 2 * bx
+        new_img = Image.new("RGB", (nw, nh), (255, 255, 255))
 
-        # Unten (gespiegelt vertikal)
-        bot_src_y = page_h_pt - expected_bleed_pt
-        bot_dst = fitz.Rect(expected_bleed_pt, expected_bleed_pt + page_h_pt,
-                            expected_bleed_pt + page_w_pt, new_h)
-        new_page.show_pdf_page(bot_dst, doc, 0,
-                               clip=fitz.Rect(0, bot_src_y, page_w_pt, page_h_pt))
+        # Original in die Mitte
+        new_img.paste(img, (bx, bx))
 
-        # Ecken (Kombination)
+        # Ränder spiegeln
+        # Links: ersten bx Pixel horizontal spiegeln
+        left_strip = img.crop((0, 0, bx, ph)).transpose(Image.FLIP_LEFT_RIGHT)
+        new_img.paste(left_strip, (0, bx))
+
+        # Rechts: letzten bx Pixel horizontal spiegeln
+        right_strip = img.crop((pw - bx, 0, pw, ph)).transpose(Image.FLIP_LEFT_RIGHT)
+        new_img.paste(right_strip, (bx + pw, bx))
+
+        # Oben: ersten bx Pixel vertikal spiegeln
+        top_strip = img.crop((0, 0, pw, bx)).transpose(Image.FLIP_TOP_BOTTOM)
+        new_img.paste(top_strip, (bx, 0))
+
+        # Unten: letzten bx Pixel vertikal spiegeln
+        bot_strip = img.crop((0, ph - bx, pw, ph)).transpose(Image.FLIP_TOP_BOTTOM)
+        new_img.paste(bot_strip, (bx, bx + ph))
+
+        # Ecken (gespiegelt)
         # Oben-links
-        new_page.show_pdf_page(fitz.Rect(0, 0, expected_bleed_pt, expected_bleed_pt),
-                               doc, 0, clip=fitz.Rect(0, 0, expected_bleed_pt, expected_bleed_pt))
+        tl = img.crop((0, 0, bx, bx)).transpose(Image.ROTATE_180)
+        new_img.paste(tl, (0, 0))
         # Oben-rechts
-        new_page.show_pdf_page(fitz.Rect(expected_bleed_pt+page_w_pt, 0, new_w, expected_bleed_pt),
-                               doc, 0, clip=fitz.Rect(right_src_x, 0, page_w_pt, expected_bleed_pt))
+        tr = img.crop((pw - bx, 0, pw, bx)).transpose(Image.ROTATE_180)
+        new_img.paste(tr, (bx + pw, 0))
         # Unten-links
-        new_page.show_pdf_page(fitz.Rect(0, expected_bleed_pt+page_h_pt, expected_bleed_pt, new_h),
-                               doc, 0, clip=fitz.Rect(0, bot_src_y, expected_bleed_pt, page_h_pt))
+        bl = img.crop((0, ph - bx, bx, ph)).transpose(Image.ROTATE_180)
+        new_img.paste(bl, (0, bx + ph))
         # Unten-rechts
-        new_page.show_pdf_page(fitz.Rect(expected_bleed_pt+page_w_pt, expected_bleed_pt+page_h_pt, new_w, new_h),
-                               doc, 0, clip=fitz.Rect(right_src_x, bot_src_y, page_w_pt, page_h_pt))
+        br = img.crop((pw - bx, ph - bx, pw, ph)).transpose(Image.ROTATE_180)
+        new_img.paste(br, (bx + pw, bx + ph))
 
-        pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
-        new_doc.close()
+        # Als PDF speichern
+        img_buf = _io.BytesIO()
+        new_img.save(img_buf, format="PDF",
+                     resolution=dpi,
+                     title="PPS Fixed")
+        pdf_bytes = img_buf.getvalue()
+
+        new_doc_check = fitz.open(stream=pdf_bytes, filetype="pdf")
+        new_doc_check.close()
+
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
-        if not fixes_applied or fixes_applied == ["Beschnittzeichen entfernt"]:
-            pass
         return pdf_bytes, fixes_applied
 
     pdf_bytes = doc.tobytes(garbage=4, deflate=True)
@@ -859,7 +864,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.4.2"}
+    return {"status": "ok", "service": "PPS API", "version": "1.5.0"}
 
 if __name__ == "__main__":
     import uvicorn
