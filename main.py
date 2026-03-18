@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.8
+Backend API · Version 1.6.9
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -711,11 +711,11 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                         cs = obj.get("/ColorSpace", pikepdf.Name("/DeviceRGB"))
                         # Schreibe neuen Stream
                         obj.stream_data = new_jpeg
-                        obj["/Width"] = pikepdf.objects.Integer(new_w)
-                        obj["/Height"] = pikepdf.objects.Integer(new_h)
+                        obj["/Width"] = new_w
+                        obj["/Height"] = new_h
                         obj["/Filter"] = pikepdf.Name("/DCTDecode")
                         obj["/ColorSpace"] = cs
-                        obj["/BitsPerComponent"] = pikepdf.objects.Integer(8)
+                        obj["/BitsPerComponent"] = 8
                         for key in ["/DecodeParms", "/Length", "/SMask"]:
                             if key in obj:
                                 del obj[key]
@@ -1094,7 +1094,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.8"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.9"}
 
 if __name__ == "__main__":
     import uvicorn
