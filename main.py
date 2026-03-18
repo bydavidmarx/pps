@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.3.7
+Backend API · Version 1.3.8
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -828,18 +828,17 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
-@app.get("/debug/jsonbin")
-def debug_jsonbin():
-    key = os.environ.get("JSONBIN_KEY", "")
-    bin_id = os.environ.get("JSONBIN_BIN_ID", "")
-    if not key or not bin_id:
-        return {"error": "Variablen fehlen", "key_set": bool(key), "bin_id_set": bool(bin_id)}
-    url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
+@app.get("/debug/kv")
+def debug_kv():
+    bucket = os.environ.get("KV_BUCKET", "")
+    if not bucket:
+        return {"error": "KV_BUCKET nicht gesetzt"}
+    url = f"https://kvdb.io/{bucket}/pps_users"
     try:
-        req = urllib.request.Request(url, headers={"X-Master-Key": key})
+        req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            return {"status": "ok", "record": data.get("record")}
+            raw = resp.read().decode()
+            return {"status": "ok", "data": raw}
     except urllib.error.HTTPError as e:
         return {"error": f"HTTP {e.code}", "body": e.read().decode()}
     except Exception as e:
@@ -847,7 +846,7 @@ def debug_jsonbin():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.3.7"}
+    return {"status": "ok", "service": "PPS API", "version": "1.3.8"}
 
 if __name__ == "__main__":
     import uvicorn
