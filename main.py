@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.3.8
+Backend API · Version 1.4.0
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -748,10 +748,11 @@ def save_users(users: dict):
         return
     try:
         payload = json.dumps(users).encode()
+        # kvdb.io uses PUT to store a value
         req = urllib.request.Request(
             KV_URL,
             data=payload,
-            method="POST",
+            method="PUT",
             headers={"Content-Type": "application/json"}
         )
         urllib.request.urlopen(req, timeout=10)
@@ -846,7 +847,7 @@ def debug_kv():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.3.8"}
+    return {"status": "ok", "service": "PPS API", "version": "1.4.0"}
 
 if __name__ == "__main__":
     import uvicorn
