@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.12
+Backend API · Version 1.6.9
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.6.12")
+app = FastAPI(title="PPS API", version="1.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,24 +76,23 @@ async def fix_pdf(
         raise HTTPException(422, "PDF konnte nicht geöffnet werden.")
 
     upscaled_count = 0
-    upscaled_bytes = None
 
-    if fix_resolution:
-        upscaled_bytes, upscaled_count = upscale_images_in_pdf(doc, scale)
-
-    # Wenn upscaling durchgeführt: mit neuem Dokument weiterarbeiten
-    if upscaled_bytes:
-        doc.close()
-        doc = fitz.open(stream=upscaled_bytes, filetype="pdf")
-
+    # Schritt 1: Bleed + Cropmarks fixen (auf Original-Dokument)
     fixed_pdf, fixes_applied = apply_fixes(
         doc, data, print_width_mm, print_height_mm, scale,
         fix_cropmarks, fix_bleed, fix_colorspace
     )
     doc.close()
 
-    if upscaled_count > 0:
-        fixes_applied.append(f"{upscaled_count} Bild(er) hochgerechnet (Lanczos)")
+    # Schritt 2: Upscaling direkt im PDF via pikepdf (KEIN Rasterisieren)
+    # Vektoren, Text und andere Elemente bleiben unberührt
+    if fix_resolution:
+        doc2 = fitz.open(stream=fixed_pdf, filetype="pdf")
+        upscaled_bytes, upscaled_count = upscale_images_in_pdf(doc2, scale)
+        doc2.close()
+        if upscaled_bytes:
+            fixed_pdf = upscaled_bytes
+            fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
 
     filename = file.filename.replace(".pdf", "") + "_PPS_fixed.pdf"
     return Response(
@@ -1072,6 +1071,142 @@ def delete_user(email: str, admin_email: str, admin_password: str):
     return {"success": True}
 
 # ─────────────────────────────────────────────
+#  ANALYSE-REPORT ALS PDF
+# ─────────────────────────────────────────────
+@app.post("/report")
+async def generate_report(
+    file: UploadFile = File(...),
+    print_width_mm: float = Form(...),
+    print_height_mm: float = Form(...),
+    scale: int = Form(10),
+    job_name: Optional[str] = Form(""),
+):
+    """Generiert einen Analyse-Report als PDF."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+    import io as _io
+    from datetime import datetime
+
+    data = await file.read()
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        raise HTTPException(422, "PDF konnte nicht geöffnet werden.")
+
+    result = run_analysis(doc, data, print_width_mm, print_height_mm, scale, job_name, file.filename)
+    doc.close()
+
+    # PDF Report erstellen
+    buf = _io.BytesIO()
+    pdf = SimpleDocTemplate(buf, pagesize=A4,
+                            rightMargin=20*mm, leftMargin=20*mm,
+                            topMargin=20*mm, bottomMargin=20*mm)
+
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Header
+    header_style = ParagraphStyle('header', fontSize=20, fontName='Helvetica-Bold',
+                                   spaceAfter=4, textColor=colors.HexColor('#1a1a18'))
+    sub_style = ParagraphStyle('sub', fontSize=9, fontName='Helvetica',
+                                textColor=colors.HexColor('#9a9a94'), spaceAfter=16)
+    label_style = ParagraphStyle('label', fontSize=8, fontName='Helvetica-Bold',
+                                  textColor=colors.HexColor('#5a5a56'), spaceBefore=12, spaceAfter=2)
+    value_style = ParagraphStyle('value', fontSize=11, fontName='Helvetica',
+                                  textColor=colors.HexColor('#1a1a18'), spaceAfter=2)
+    note_style = ParagraphStyle('note', fontSize=8, fontName='Helvetica',
+                                 textColor=colors.HexColor('#9a9a94'), spaceAfter=8)
+
+    story.append(Paragraph("PPS – Pre Production Service", header_style))
+    story.append(Paragraph("Analyse-Report", sub_style))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#d0cdc4')))
+    story.append(Spacer(1, 12))
+
+    # Meta
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    meta = [
+        ["Auftragsname", result.get("job_name") or result.get("filename", "–")],
+        ["Datei", result.get("filename", "–")],
+        ["Druckgröße", f"{print_width_mm:.0f} × {print_height_mm:.0f} mm"],
+        ["Maßstab", f"1:{scale}"],
+        ["Datum", now],
+        ["Gesamtstatus", {"ok": "✓ Druckfertig", "warn": "⚠ Warnungen", "error": "✕ Fehler gefunden"}
+                         .get(result.get("overall_status",""), "–")],
+    ]
+    t = Table(meta, colWidths=[50*mm, 120*mm])
+    t.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
+        ('FONTNAME', (1,0), (1,-1), 'Helvetica'),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('TEXTCOLOR', (0,0), (0,-1), colors.HexColor('#5a5a56')),
+        ('TEXTCOLOR', (1,0), (1,-1), colors.HexColor('#1a1a18')),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('ROWBACKGROUNDS', (0,0), (-1,-1), [colors.HexColor('#f5f3ee'), colors.white]),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#d0cdc4')))
+    story.append(Spacer(1, 8))
+
+    # Checks
+    story.append(Paragraph("PRÜFERGEBNISSE", ParagraphStyle('h2', fontSize=9,
+                fontName='Helvetica-Bold', textColor=colors.HexColor('#9a9a94'),
+                spaceBefore=8, spaceAfter=8, letterSpacing=1)))
+
+    status_colors = {"ok": '#2d6a3f', "warn": '#c96a10', "error": '#c0392b'}
+    status_icons  = {"ok": "✓", "warn": "!", "error": "✕"}
+
+    for check in result.get("checks", []):
+        s = check.get("status", "ok")
+        color = colors.HexColor(status_colors.get(s, '#1a1a18'))
+        icon = status_icons.get(s, "·")
+
+        row_data = [[
+            Paragraph(f'<font color="{status_colors.get(s, "#1a1a18")}">{icon}</font>',
+                      ParagraphStyle('icon', fontSize=12, fontName='Helvetica-Bold')),
+            Paragraph(f'<b>{check.get("label","").upper()}</b><br/>'
+                      f'{check.get("value","–")}',
+                      ParagraphStyle('cv', fontSize=9, fontName='Helvetica',
+                                     textColor=colors.HexColor('#1a1a18'), leading=14)),
+            Paragraph(check.get("note",""),
+                      ParagraphStyle('cn', fontSize=8, fontName='Helvetica',
+                                     textColor=colors.HexColor('#9a9a94'), leading=11)),
+        ]]
+        ct = Table(row_data, colWidths=[8*mm, 60*mm, 100*mm])
+        ct.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('TOPPADDING', (0,0), (-1,-1), 6),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+            ('LINEBELOW', (0,0), (-1,-1), 0.3, colors.HexColor('#eceae3')),
+        ]))
+        story.append(ct)
+
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#d0cdc4')))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        f"PPS Version //A_1.7 · Pre Production Service · DCP · {now}",
+        ParagraphStyle('footer', fontSize=7, fontName='Helvetica',
+                        textColor=colors.HexColor('#9a9a94'), alignment=TA_CENTER)
+    ))
+
+    pdf.build(story)
+    report_bytes = buf.getvalue()
+
+    filename = file.filename.replace(".pdf", "") + "_PPS_Report.pdf"
+    return Response(
+        content=report_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+# ─────────────────────────────────────────────
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
 @app.get("/debug/store")
@@ -1096,7 +1231,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.12"}
+    return {"status": "ok", "service": "PPS API", "version": "1.7.1"}
 
 if __name__ == "__main__":
     import uvicorn
