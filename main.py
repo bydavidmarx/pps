@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.10
+Backend API · Version 1.6.12
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.3.6")
+app = FastAPI(title="PPS API", version="1.6.12")
 
 app.add_middleware(
     CORSMiddleware,
@@ -655,7 +655,7 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             if dpi_1to1 >= min_dpi_1to1 or dpi_1to1 < 25.0:
                 continue
 
-            factor = min(min_dpi_1to1 / dpi_1to1, 4.0)
+            factor = min(100.0 / dpi_1to1, 4.0)  # Ziel: 100 DPI@1:1
             to_upscale.append({
                 "xref": xref,
                 "rect": r,
@@ -709,19 +709,18 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                     print(f"[PPS]   xobj '{name}': {obj_w}x{obj_h}", file=sys.stderr)
                     if obj_w == item["w"] and obj_h == item["h"]:
                         cs = obj.get("/ColorSpace", pikepdf.Name("/DeviceRGB"))
-                        # Schreibe neuen Stream
-                        obj.stream_data = new_jpeg
-                        obj["/Width"] = new_w
-                        obj["/Height"] = new_h
-                        obj["/Filter"] = pikepdf.Name("/DCTDecode")
-                        obj["/ColorSpace"] = cs
-                        obj["/BitsPerComponent"] = 8
-                        for key in ["/DecodeParms", "/SMask"]:
-                            if key in obj:
-                                try:
-                                    del obj[key]
-                                except Exception:
-                                    pass
+                        # Neuen Stream mit make_stream erstellen — korrekte pikepdf Methode
+                        new_stream = pdf_pk.make_stream(
+                            new_jpeg,
+                            Type=pikepdf.Name("/XObject"),
+                            Subtype=pikepdf.Name("/Image"),
+                            Width=new_w,
+                            Height=new_h,
+                            ColorSpace=cs,
+                            BitsPerComponent=8,
+                            Filter=pikepdf.Name("/DCTDecode"),
+                        )
+                        xobjects[name] = pdf_pk.make_indirect(new_stream)
                         upscaled_count += 1
                         new_dpi = item["dpi_1to1"] * item["factor"]
                         print(f"[PPS] REPLACED '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
@@ -1097,7 +1096,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.6.10"}
+    return {"status": "ok", "service": "PPS API", "version": "1.6.12"}
 
 if __name__ == "__main__":
     import uvicorn
