@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.6.9
+Backend API · Version 1.7
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.7.1")
+app = FastAPI(title="PPS API", version="1.8.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +77,13 @@ async def fix_pdf(
 
     upscaled_count = 0
 
+    # Analyse für Report
+    try:
+        analysis_result = run_analysis(doc, data, print_width_mm, print_height_mm,
+                                       scale, "", file.filename)
+    except Exception:
+        analysis_result = None
+
     # Schritt 1: Bleed + Cropmarks fixen (auf Original-Dokument)
     fixed_pdf, fixes_applied = apply_fixes(
         doc, data, print_width_mm, print_height_mm, scale,
@@ -94,13 +101,48 @@ async def fix_pdf(
             fixed_pdf = upscaled_bytes
             fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
 
-    filename = file.filename.replace(".pdf", "") + "_PPS_fixed.pdf"
-    return Response(
-        content=fixed_pdf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"',
-                 "X-Fixes-Applied": ", ".join(fixes_applied)}
-    )
+    import zipfile
+    import io as _zip_io
+    from datetime import datetime
+
+    base_name = file.filename.replace(".pdf", "")
+    fixed_name = base_name + "_PPS_fixed.pdf"
+
+    # Report generieren
+    try:
+        report_bytes = _generate_report_bytes(
+            result_data=analysis_result,
+            filename=file.filename,
+            job_name="",
+            print_w=print_width_mm,
+            print_h=print_height_mm,
+            scale=scale,
+            fixes_applied=fixes_applied,
+            scale_val=scale
+        )
+    except Exception:
+        report_bytes = None
+
+    if report_bytes:
+        # ZIP mit PDF + Report
+        zip_buf = _zip_io.BytesIO()
+        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(fixed_name, fixed_pdf)
+            zf.writestr(base_name + "_PPS_Report.pdf", report_bytes)
+        zip_buf.seek(0)
+        return Response(
+            content=zip_buf.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{base_name}_PPS.zip"',
+                     "X-Fixes-Applied": ", ".join(fixes_applied)}
+        )
+    else:
+        return Response(
+            content=fixed_pdf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{fixed_name}"',
+                     "X-Fixes-Applied": ", ".join(fixes_applied)}
+        )
 
 
 # ─────────────────────────────────────────────
@@ -842,6 +884,8 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         fixes_applied.append("Beschnittzeichen entfernt")
 
     # ── Schritt 2: Beschnittzugabe durch Randspiegelung ──
+    # Vektortreu: Original bleibt als Vektor, nur Randstreifen werden als
+    # Pixmap-Elemente angefügt
     if fix_bleed:
         expected_bleed_mm = 20.0 / scale
         expected_bleed_pt = expected_bleed_mm / PT_TO_MM
@@ -850,84 +894,97 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         trimbox = page.trimbox
         mediabox = page.mediabox
 
-        # Bestimme den echten Druckbereich:
-        # 1. TrimBox vorhanden → nutze TrimBox
-        # 2. Keine TrimBox aber Beschnittzeichen → nutze MediaBox minus erkannte Marge
-        # 3. Sonst → nutze gesamte MediaBox
         if trimbox and trimbox != mediabox:
             clip_rect = trimbox
         else:
-            # Keine TrimBox — versuche Beschnittzeichen-Bereich zu schätzen
-            # durch Analyse der Zeichenpfade außerhalb des Kernbereichs
             clip_rect = _estimate_trim_area(page, mediabox)
 
         W = clip_rect.width
         H = clip_rect.height
         B = expected_bleed_pt
 
+        # Neues Dokument: größere Seite
+        new_doc = fitz.open()
+        new_w = W + 2 * B
+        new_h = H + 2 * B
+        new_page = new_doc.new_page(width=new_w, height=new_h)
+
+        # Original-Inhalt in die Mitte einbetten (als Vektor-PDF)
+        dst_rect = fitz.Rect(B, B, B + W, B + H)
+        new_page.show_pdf_page(dst_rect, doc, 0, clip=clip_rect)
+
+        # Randstreifen als Pixmaps rendern und einbetten
         dpi = 150
-        scale_factor = dpi / 72.0
-        mat = fitz.Matrix(scale_factor, scale_factor)
-        pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip_rect)
+        sf = dpi / 72.0
 
-        pw = pix.width   # Pixmap-Breite
-        ph = pix.height  # Pixmap-Höhe
-        bx = int(B * scale_factor)  # Beschnitt in Pixel
+        def render_strip(clip):
+            mat = fitz.Matrix(sf, sf)
+            return page.get_pixmap(matrix=mat, alpha=False, clip=clip)
 
-        # PIL für Spiegelung nutzen
         from PIL import Image
         import io as _io
 
-        img = Image.frombytes("RGB", (pw, ph), pix.samples)
+        def pix_to_img(pix):
+            return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-        # Neue Bildgröße mit Beschnitt
-        nw = pw + 2 * bx
-        nh = ph + 2 * bx
-        new_img = Image.new("RGB", (nw, nh), (255, 255, 255))
+        def img_to_stream(img):
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=92)
+            return buf.getvalue()
 
-        # Original in die Mitte
-        new_img.paste(img, (bx, bx))
+        # Links
+        if B > 0:
+            strip_left = pix_to_img(render_strip(
+                fitz.Rect(clip_rect.x0, clip_rect.y0, clip_rect.x0 + B, clip_rect.y1)
+            )).transpose(Image.FLIP_LEFT_RIGHT)
+            new_page.insert_image(
+                fitz.Rect(0, B, B, B + H),
+                stream=img_to_stream(strip_left)
+            )
 
-        # Ränder spiegeln
-        # Links: ersten bx Pixel horizontal spiegeln
-        left_strip = img.crop((0, 0, bx, ph)).transpose(Image.FLIP_LEFT_RIGHT)
-        new_img.paste(left_strip, (0, bx))
+        # Rechts
+        if B > 0:
+            strip_right = pix_to_img(render_strip(
+                fitz.Rect(clip_rect.x1 - B, clip_rect.y0, clip_rect.x1, clip_rect.y1)
+            )).transpose(Image.FLIP_LEFT_RIGHT)
+            new_page.insert_image(
+                fitz.Rect(B + W, B, B + W + B, B + H),
+                stream=img_to_stream(strip_right)
+            )
 
-        # Rechts: letzten bx Pixel horizontal spiegeln
-        right_strip = img.crop((pw - bx, 0, pw, ph)).transpose(Image.FLIP_LEFT_RIGHT)
-        new_img.paste(right_strip, (bx + pw, bx))
+        # Oben
+        if B > 0:
+            strip_top = pix_to_img(render_strip(
+                fitz.Rect(clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y0 + B)
+            )).transpose(Image.FLIP_TOP_BOTTOM)
+            new_page.insert_image(
+                fitz.Rect(B, 0, B + W, B),
+                stream=img_to_stream(strip_top)
+            )
 
-        # Oben: ersten bx Pixel vertikal spiegeln
-        top_strip = img.crop((0, 0, pw, bx)).transpose(Image.FLIP_TOP_BOTTOM)
-        new_img.paste(top_strip, (bx, 0))
+        # Unten
+        if B > 0:
+            strip_bot = pix_to_img(render_strip(
+                fitz.Rect(clip_rect.x0, clip_rect.y1 - B, clip_rect.x1, clip_rect.y1)
+            )).transpose(Image.FLIP_TOP_BOTTOM)
+            new_page.insert_image(
+                fitz.Rect(B, B + H, B + W, B + H + B),
+                stream=img_to_stream(strip_bot)
+            )
 
-        # Unten: letzten bx Pixel vertikal spiegeln
-        bot_strip = img.crop((0, ph - bx, pw, ph)).transpose(Image.FLIP_TOP_BOTTOM)
-        new_img.paste(bot_strip, (bx, bx + ph))
+        # Ecken
+        if B > 0:
+            tl = pix_to_img(render_strip(fitz.Rect(clip_rect.x0, clip_rect.y0, clip_rect.x0+B, clip_rect.y0+B))).transpose(Image.ROTATE_180)
+            new_page.insert_image(fitz.Rect(0, 0, B, B), stream=img_to_stream(tl))
+            tr = pix_to_img(render_strip(fitz.Rect(clip_rect.x1-B, clip_rect.y0, clip_rect.x1, clip_rect.y0+B))).transpose(Image.ROTATE_180)
+            new_page.insert_image(fitz.Rect(B+W, 0, B+W+B, B), stream=img_to_stream(tr))
+            bl = pix_to_img(render_strip(fitz.Rect(clip_rect.x0, clip_rect.y1-B, clip_rect.x0+B, clip_rect.y1))).transpose(Image.ROTATE_180)
+            new_page.insert_image(fitz.Rect(0, B+H, B, B+H+B), stream=img_to_stream(bl))
+            br = pix_to_img(render_strip(fitz.Rect(clip_rect.x1-B, clip_rect.y1-B, clip_rect.x1, clip_rect.y1))).transpose(Image.ROTATE_180)
+            new_page.insert_image(fitz.Rect(B+W, B+H, B+W+B, B+H+B), stream=img_to_stream(br))
 
-        # Ecken (gespiegelt)
-        # Oben-links
-        tl = img.crop((0, 0, bx, bx)).transpose(Image.ROTATE_180)
-        new_img.paste(tl, (0, 0))
-        # Oben-rechts
-        tr = img.crop((pw - bx, 0, pw, bx)).transpose(Image.ROTATE_180)
-        new_img.paste(tr, (bx + pw, 0))
-        # Unten-links
-        bl = img.crop((0, ph - bx, bx, ph)).transpose(Image.ROTATE_180)
-        new_img.paste(bl, (0, bx + ph))
-        # Unten-rechts
-        br = img.crop((pw - bx, ph - bx, pw, ph)).transpose(Image.ROTATE_180)
-        new_img.paste(br, (bx + pw, bx + ph))
-
-        # Als PDF speichern
-        img_buf = _io.BytesIO()
-        new_img.save(img_buf, format="PDF",
-                     resolution=dpi,
-                     title="PPS Fixed")
-        pdf_bytes = img_buf.getvalue()
-
-        new_doc_check = fitz.open(stream=pdf_bytes, filetype="pdf")
-        new_doc_check.close()
+        pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
+        new_doc.close()
 
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
         return pdf_bytes, fixes_applied
@@ -1073,6 +1130,120 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 #  ANALYSE-REPORT ALS PDF
 # ─────────────────────────────────────────────
+def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, scale,
+                            fixes_applied=None, fixed_pdf_bytes=None, scale_val=1):
+    """Generiert Report-PDF als bytes. Wird intern und vom /report Endpoint genutzt."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib.enums import TA_CENTER
+    import io as _io
+    from datetime import datetime
+
+    buf = _io.BytesIO()
+    pdf = SimpleDocTemplate(buf, pagesize=A4,
+                            rightMargin=20*mm, leftMargin=20*mm,
+                            topMargin=20*mm, bottomMargin=20*mm)
+    story = []
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    def ps(name, **kw):
+        return ParagraphStyle(name, **kw)
+
+    h1 = ps('h1', fontSize=20, fontName='Helvetica-Bold', spaceAfter=4,
+             textColor=colors.HexColor('#1a1a18'))
+    sub = ps('sub', fontSize=9, fontName='Helvetica',
+             textColor=colors.HexColor('#9a9a94'), spaceAfter=16)
+    note = ps('note', fontSize=8, fontName='Helvetica',
+              textColor=colors.HexColor('#9a9a94'), leading=11)
+    footer_s = ps('footer', fontSize=7, fontName='Helvetica',
+                  textColor=colors.HexColor('#9a9a94'), alignment=TA_CENTER)
+
+    story.append(Paragraph("PPS – Pre Production Service", h1))
+    story.append(Paragraph("Analyse-Report", sub))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor('#d0cdc4')))
+    story.append(Spacer(1, 12))
+
+    overall = result_data.get("overall_status", "ok") if result_data else "ok"
+    status_label = {"ok": "✓ Druckfertig", "warn": "⚠ Warnungen",
+                    "error": "✕ Fehler gefunden"}.get(overall, "–")
+
+    meta = [
+        ["Auftragsname", job_name or filename or "–"],
+        ["Datei", filename or "–"],
+        ["Druckgröße", f"{print_w:.0f} × {print_h:.0f} mm"],
+        ["Maßstab", f"1:{scale_val}"],
+        ["Datum", now],
+        ["Status", status_label],
+    ]
+    if fixes_applied:
+        meta.append(["Korrekturen", " · ".join(fixes_applied)])
+
+    t = Table(meta, colWidths=[48*mm, 122*mm])
+    t.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
+        ('FONTNAME', (1,0), (1,-1), 'Helvetica'),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('TEXTCOLOR', (0,0), (0,-1), colors.HexColor('#5a5a56')),
+        ('TEXTCOLOR', (1,0), (1,-1), colors.HexColor('#1a1a18')),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('ROWBACKGROUNDS', (0,0), (-1,-1),
+         [colors.HexColor('#f5f3ee'), colors.white]),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 16))
+
+    if result_data and result_data.get("checks"):
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor('#d0cdc4')))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("PRÜFERGEBNISSE",
+            ps('h2', fontSize=9, fontName='Helvetica-Bold',
+               textColor=colors.HexColor('#9a9a94'), spaceBefore=8,
+               spaceAfter=8, letterSpacing=1)))
+
+        sc = {"ok": '#2d6a3f', "warn": '#c96a10', "error": '#c0392b'}
+        si = {"ok": "✓", "warn": "!", "error": "✕"}
+
+        for check in result_data["checks"]:
+            s = check.get("status", "ok")
+            row = [[
+                Paragraph(f'<font color="{sc.get(s,"#1a1a18")}">{si.get(s,"·")}</font>',
+                          ps('ic', fontSize=12, fontName='Helvetica-Bold')),
+                Paragraph(f'<b>{check.get("label","").upper()}</b><br/>'
+                          f'{check.get("value","–")}',
+                          ps('cv', fontSize=9, fontName='Helvetica',
+                             textColor=colors.HexColor('#1a1a18'), leading=14)),
+                Paragraph(check.get("note",""),
+                          ps('cn', fontSize=8, fontName='Helvetica',
+                             textColor=colors.HexColor('#9a9a94'), leading=11)),
+            ]]
+            ct = Table(row, colWidths=[8*mm, 60*mm, 100*mm])
+            ct.setStyle(TableStyle([
+                ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ('TOPPADDING', (0,0), (-1,-1), 5),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+                ('LINEBELOW', (0,0), (-1,-1), 0.3,
+                 colors.HexColor('#eceae3')),
+            ]))
+            story.append(ct)
+
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor('#d0cdc4')))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        f"PPS Version //A_1.8 · Pre Production Service · DCP · {now}",
+        footer_s))
+
+    pdf.build(story)
+    return buf.getvalue()
+
+
 @app.post("/report")
 async def generate_report(
     file: UploadFile = File(...),
@@ -1231,7 +1402,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.7.1"}
+    return {"status": "ok", "service": "PPS API", "version": "1.8.1"}
 
 if __name__ == "__main__":
     import uvicorn
