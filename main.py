@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.9.5
+Backend API · Version 1.9.6
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.9.5")
+app = FastAPI(title="PPS API", version="1.9.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,6 +68,7 @@ async def fix_pdf(
     fix_bleed: bool = Form(True),
     fix_colorspace: bool = Form(False),
     fix_resolution: bool = Form(False),
+    job_name: Optional[str] = Form(""),
 ):
     data = await file.read()
     try:
@@ -166,14 +167,14 @@ async def fix_pdf(
             content=zip_buf.getvalue(),
             media_type="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{base_name}_PPS.zip"',
-                     "X-Fixes-Applied": ", ".join(fixes_applied)}
+                     "X-Fixes-Applied": ", ".join(fixes_applied).encode("ascii","ignore").decode()}
         )
     else:
         return Response(
             content=fixed_pdf,
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{fixed_name}"',
-                     "X-Fixes-Applied": ", ".join(fixes_applied)}
+                     "X-Fixes-Applied": ", ".join(fixes_applied).encode("ascii","ignore").decode()}
         )
 
 
@@ -1566,7 +1567,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.9.5"}
+    return {"status": "ok", "service": "PPS API", "version": "1.9.6"}
 
 if __name__ == "__main__":
     import uvicorn
