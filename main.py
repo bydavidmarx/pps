@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.9.4
+Backend API · Version 1.9.5
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.9.4")
+app = FastAPI(title="PPS API", version="1.9.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,6 +101,18 @@ async def fix_pdf(
     if upscaled_count > 0:
         fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
 
+    # Warnung für nicht-fixbare Bilder (unter 25 DPI)
+    if analysis_result:
+        for check in analysis_result.get("checks", []):
+            if check.get("id") == "resolution":
+                imgs = check.get("details", {}).get("images", [])
+                bad = [i for i in imgs if i.get("dpi_at_1to1", 0) < 25]
+                if bad:
+                    fixes_applied.append(
+                        f"⚠ {len(bad)} Bild(er) unter 25 DPI — "
+                        f"zu niedrig für Upscaling, Originaldatei erforderlich"
+                    )
+
     import zipfile
     import io as _zip_io
     from datetime import datetime
@@ -129,7 +141,7 @@ async def fix_pdf(
         report_bytes = _generate_report_bytes(
             result_data=analysis_result,
             filename=file.filename,
-            job_name="",
+            job_name=job_name or "",
             print_w=print_width_mm,
             print_h=print_height_mm,
             scale=scale,
@@ -1202,12 +1214,12 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
     # ── Header ──
     story.append(Paragraph(
         '<font size="8" color="#9a9a94">PRE PRODUCTION SERVICE · DCP</font>',
-        ps('brand', spaceAfter=4)))
+        ps('brand', spaceAfter=2)))
     story.append(Paragraph("Analyse-Report",
         ps('title', fontSize=22, fontName='Helvetica-Bold',
-           textColor=colors.HexColor('#1a1a18'), spaceAfter=4)))
-    story.append(Paragraph(now, ps('date', fontSize=9,
-           textColor=colors.HexColor('#9a9a94'), spaceAfter=10)))
+           textColor=colors.HexColor('#1a1a18'), spaceAfter=2)))
+    story.append(Paragraph(now,
+        ps('date', fontSize=9, textColor=colors.HexColor('#9a9a94'), spaceAfter=10)))
     story.append(HRFlowable(width="100%", thickness=0.5,
                             color=colors.HexColor('#d0cdc4'), spaceAfter=12))
 
@@ -1347,17 +1359,39 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
     # ── Korrekturen ──
     if fixes_applied:
         story.append(Spacer(1, 10))
-        fixes_t = Table([[
-            Paragraph('<b><font color="#2d6a3f">KORREKTUREN</font></b>',
-                      ps('fl', fontSize=8)),
-            Paragraph(' · '.join(fixes_applied),
-                      ps('fi', fontSize=8, textColor=colors.HexColor('#2d6a3f'))),
-        ]], colWidths=[30*mm, 140*mm])
+        has_warning = any('⚠' in f for f in fixes_applied)
+        bg_color = colors.HexColor('#fef3cd') if has_warning else colors.HexColor('#e8f4ec')
+        label_color = '#c96a10' if has_warning else '#2d6a3f'
+        text_color = colors.HexColor('#c96a10') if has_warning else colors.HexColor('#2d6a3f')
+
+        # Normale Korrekturen und Warnungen trennen
+        normal = [f for f in fixes_applied if '⚠' not in f]
+        warnings = [f for f in fixes_applied if '⚠' in f]
+
+        rows = []
+        if normal:
+            rows.append([
+                Paragraph(f'<b><font color="#2d6a3f">KORREKTUREN</font></b>',
+                          ps('fl', fontSize=8)),
+                Paragraph(' · '.join(normal),
+                          ps('fi', fontSize=8, textColor=colors.HexColor('#2d6a3f'))),
+            ])
+        for w in warnings:
+            rows.append([
+                Paragraph('<b><font color="#c0392b">⚠ ACHTUNG</font></b>',
+                          ps('wl', fontSize=8)),
+                Paragraph(w.replace('⚠ ', ''),
+                          ps('wi', fontSize=8, textColor=colors.HexColor('#c0392b'))),
+            ])
+
+        fixes_t = Table(rows, colWidths=[30*mm, 140*mm])
         fixes_t.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#e8f4ec')),
-            ('TOPPADDING', (0,0), (-1,-1), 8),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ('BACKGROUND', (0, len(normal)), (-1,-1), colors.HexColor('#fdecea')),
+            ('TOPPADDING', (0,0), (-1,-1), 7),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 7),
             ('LEFTPADDING', (0,0), (-1,-1), 10),
+            ('LINEBELOW', (0,0), (-1,-2), 0.3, colors.HexColor('#d0cdc4')),
         ]))
         story.append(fixes_t)
 
@@ -1532,7 +1566,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.9.4"}
+    return {"status": "ok", "service": "PPS API", "version": "1.9.5"}
 
 if __name__ == "__main__":
     import uvicorn
