@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.8.2
+Backend API · Version 1.8.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.8.2")
+app = FastAPI(title="PPS API", version="1.8.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -279,7 +279,7 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
         "status": img_status,
         "value": img_value,
         "note": img_note,
-        "fixable": img_status in ("warn",),
+        "fixable": img_status in ("warn", "error"),  # error kann teilweise fixbar sein
         "details": {"images": images, "min_dpi": round(min_dpi_doc, 1), "critical_dpi": round(critical_dpi, 1)}
     })
 
@@ -1415,7 +1415,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.8.2"}
+    return {"status": "ok", "service": "PPS API", "version": "1.8.3"}
 
 if __name__ == "__main__":
     import uvicorn
