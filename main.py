@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.7
+Backend API · Version 1.8.2
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.8.1")
+app = FastAPI(title="PPS API", version="1.8.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -903,85 +903,98 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         H = clip_rect.height
         B = expected_bleed_pt
 
-        # Neues Dokument: größere Seite
+        # Koordinaten normalisieren: clip_rect kann bei x0>0,y0>0 beginnen
+        # Für Randstreifen brauchen wir absolute Koordinaten auf der Originalseite
+        cx0 = clip_rect.x0
+        cy0 = clip_rect.y0
+        cx1 = clip_rect.x1
+        cy1 = clip_rect.y1
+
+        from PIL import Image
+        import io as _io
+
+        # Randstreifen als Pixmaps rendern
+        dpi = 150
+        sf = dpi / 72.0
+
+        def render_strip(x0, y0, x1, y1):
+            mat = fitz.Matrix(sf, sf)
+            return page.get_pixmap(matrix=mat, alpha=False,
+                                   clip=fitz.Rect(x0, y0, x1, y1))
+
+        def pix_to_img(pix):
+            return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+        def img_to_bytes(img):
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=92)
+            return buf.getvalue()
+
+        # Streifen rendern (aus Originalkoordinaten)
+        strip_l = pix_to_img(render_strip(cx0, cy0, cx0 + B, cy1)).transpose(Image.FLIP_LEFT_RIGHT)
+        strip_r = pix_to_img(render_strip(cx1 - B, cy0, cx1, cy1)).transpose(Image.FLIP_LEFT_RIGHT)
+        strip_t = pix_to_img(render_strip(cx0, cy0, cx1, cy0 + B)).transpose(Image.FLIP_TOP_BOTTOM)
+        strip_b = pix_to_img(render_strip(cx0, cy1 - B, cx1, cy1)).transpose(Image.FLIP_TOP_BOTTOM)
+        corner_tl = pix_to_img(render_strip(cx0, cy0, cx0+B, cy0+B)).transpose(Image.ROTATE_180)
+        corner_tr = pix_to_img(render_strip(cx1-B, cy0, cx1, cy0+B)).transpose(Image.ROTATE_180)
+        corner_bl = pix_to_img(render_strip(cx0, cy1-B, cx0+B, cy1)).transpose(Image.ROTATE_180)
+        corner_br = pix_to_img(render_strip(cx1-B, cy1-B, cx1, cy1)).transpose(Image.ROTATE_180)
+
+        # Vollbild der Originalseite rendern für die Mitte
+        # (inkl. Randstreifen als Basis)
+        full_sf = sf
+        full_mat = fitz.Matrix(full_sf, full_sf)
+        full_pix = page.get_pixmap(matrix=full_mat, alpha=False,
+                                    clip=fitz.Rect(cx0, cy0, cx1, cy1))
+        full_img = pix_to_img(full_pix)
+
+        # Gesamtbild aufbauen
+        bx = int(B * sf)
+        pw = int(W * sf)
+        ph = int(H * sf)
+        nw_px = pw + 2 * bx
+        nh_px = ph + 2 * bx
+
+        canvas = Image.new("RGB", (nw_px, nh_px), (255, 255, 255))
+
+        # Streifen einfügen
+        canvas.paste(corner_tl.resize((bx, bx), Image.LANCZOS), (0, 0))
+        canvas.paste(strip_t.resize((pw, bx), Image.LANCZOS), (bx, 0))
+        canvas.paste(corner_tr.resize((bx, bx), Image.LANCZOS), (bx+pw, 0))
+        canvas.paste(strip_l.resize((bx, ph), Image.LANCZOS), (0, bx))
+        canvas.paste(full_img, (bx, bx))
+        canvas.paste(strip_r.resize((bx, ph), Image.LANCZOS), (bx+pw, bx))
+        canvas.paste(corner_bl.resize((bx, bx), Image.LANCZOS), (0, bx+ph))
+        canvas.paste(strip_b.resize((pw, bx), Image.LANCZOS), (bx, bx+ph))
+        canvas.paste(corner_br.resize((bx, bx), Image.LANCZOS), (bx+pw, bx+ph))
+
+        # Als PDF exportieren — aber NUR die Randstreifen als Pixel
+        # Die Mitte bleibt als Vektor
         new_doc = fitz.open()
         new_w = W + 2 * B
         new_h = H + 2 * B
         new_page = new_doc.new_page(width=new_w, height=new_h)
 
-        # Original-Inhalt in die Mitte einbetten (als Vektor-PDF)
-        dst_rect = fitz.Rect(B, B, B + W, B + H)
-        new_page.show_pdf_page(dst_rect, doc, 0, clip=clip_rect)
+        # Original-Vektorinhalt in die Mitte
+        new_page.show_pdf_page(
+            fitz.Rect(B, B, B + W, B + H), doc, 0,
+            clip=fitz.Rect(cx0, cy0, cx1, cy1)
+        )
 
-        # Randstreifen als Pixmaps rendern und einbetten
-        dpi = 150
-        sf = dpi / 72.0
-
-        def render_strip(clip):
-            mat = fitz.Matrix(sf, sf)
-            return page.get_pixmap(matrix=mat, alpha=False, clip=clip)
-
-        from PIL import Image
-        import io as _io
-
-        def pix_to_img(pix):
-            return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
-        def img_to_stream(img):
+        # Nur die Randstreifen als Pixmaps einfügen
+        def insert_strip(img, rect):
             buf = _io.BytesIO()
             img.save(buf, format="JPEG", quality=92)
-            return buf.getvalue()
+            new_page.insert_image(rect, stream=buf.getvalue())
 
-        # Links
-        if B > 0:
-            strip_left = pix_to_img(render_strip(
-                fitz.Rect(clip_rect.x0, clip_rect.y0, clip_rect.x0 + B, clip_rect.y1)
-            )).transpose(Image.FLIP_LEFT_RIGHT)
-            new_page.insert_image(
-                fitz.Rect(0, B, B, B + H),
-                stream=img_to_stream(strip_left)
-            )
-
-        # Rechts
-        if B > 0:
-            strip_right = pix_to_img(render_strip(
-                fitz.Rect(clip_rect.x1 - B, clip_rect.y0, clip_rect.x1, clip_rect.y1)
-            )).transpose(Image.FLIP_LEFT_RIGHT)
-            new_page.insert_image(
-                fitz.Rect(B + W, B, B + W + B, B + H),
-                stream=img_to_stream(strip_right)
-            )
-
-        # Oben
-        if B > 0:
-            strip_top = pix_to_img(render_strip(
-                fitz.Rect(clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y0 + B)
-            )).transpose(Image.FLIP_TOP_BOTTOM)
-            new_page.insert_image(
-                fitz.Rect(B, 0, B + W, B),
-                stream=img_to_stream(strip_top)
-            )
-
-        # Unten
-        if B > 0:
-            strip_bot = pix_to_img(render_strip(
-                fitz.Rect(clip_rect.x0, clip_rect.y1 - B, clip_rect.x1, clip_rect.y1)
-            )).transpose(Image.FLIP_TOP_BOTTOM)
-            new_page.insert_image(
-                fitz.Rect(B, B + H, B + W, B + H + B),
-                stream=img_to_stream(strip_bot)
-            )
-
-        # Ecken
-        if B > 0:
-            tl = pix_to_img(render_strip(fitz.Rect(clip_rect.x0, clip_rect.y0, clip_rect.x0+B, clip_rect.y0+B))).transpose(Image.ROTATE_180)
-            new_page.insert_image(fitz.Rect(0, 0, B, B), stream=img_to_stream(tl))
-            tr = pix_to_img(render_strip(fitz.Rect(clip_rect.x1-B, clip_rect.y0, clip_rect.x1, clip_rect.y0+B))).transpose(Image.ROTATE_180)
-            new_page.insert_image(fitz.Rect(B+W, 0, B+W+B, B), stream=img_to_stream(tr))
-            bl = pix_to_img(render_strip(fitz.Rect(clip_rect.x0, clip_rect.y1-B, clip_rect.x0+B, clip_rect.y1))).transpose(Image.ROTATE_180)
-            new_page.insert_image(fitz.Rect(0, B+H, B, B+H+B), stream=img_to_stream(bl))
-            br = pix_to_img(render_strip(fitz.Rect(clip_rect.x1-B, clip_rect.y1-B, clip_rect.x1, clip_rect.y1))).transpose(Image.ROTATE_180)
-            new_page.insert_image(fitz.Rect(B+W, B+H, B+W+B, B+H+B), stream=img_to_stream(br))
+        insert_strip(strip_l, fitz.Rect(0, B, B, B+H))
+        insert_strip(strip_r, fitz.Rect(B+W, B, B+W+B, B+H))
+        insert_strip(strip_t, fitz.Rect(B, 0, B+W, B))
+        insert_strip(strip_b, fitz.Rect(B, B+H, B+W, B+H+B))
+        insert_strip(corner_tl, fitz.Rect(0, 0, B, B))
+        insert_strip(corner_tr, fitz.Rect(B+W, 0, B+W+B, B))
+        insert_strip(corner_bl, fitz.Rect(0, B+H, B, B+H+B))
+        insert_strip(corner_br, fitz.Rect(B+W, B+H, B+W+B, B+H+B))
 
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
@@ -1402,7 +1415,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.8.1"}
+    return {"status": "ok", "service": "PPS API", "version": "1.8.2"}
 
 if __name__ == "__main__":
     import uvicorn
