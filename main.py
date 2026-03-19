@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.8.9
+Backend API · Version 1.9.1
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.9.0")
+app = FastAPI(title="PPS API", version="1.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1182,207 +1182,208 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 # ─────────────────────────────────────────────
 def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, scale,
                             fixes_applied=None, scale_val=1, preview_bytes=None):
-    """Generiert Report-PDF via WeasyPrint — exakt im Look der HTML-Analyse."""
-    from weasyprint import HTML, CSS
-    import base64
+    """Generiert Report-PDF via ReportLab im Look der HTML-Analyse."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                     TableStyle, HRFlowable, Image as RLImage,
+                                     KeepTogether)
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
     import io as _io
     from datetime import datetime
 
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     overall = result_data.get("overall_status", "ok") if result_data else "ok"
-    status_colors = {"ok": "#2d6a3f", "warn": "#c96a10", "error": "#c0392b"}
-    status_icons  = {"ok": "✓", "warn": "!", "error": "✕"}
-    status_label  = {"ok": "Druckfertig", "warn": "Warnungen vorhanden",
-                     "error": "Fehler gefunden"}.get(overall, "–")
-    overall_color = status_colors.get(overall, "#1a1a18")
+    sc = {"ok": "#2d6a3f", "warn": "#c96a10", "error": "#c0392b"}
+    si = {"ok": "✓", "warn": "!", "error": "✕"}
+    status_label = {"ok": "Druckfertig", "warn": "Warnungen vorhanden",
+                    "error": "Fehler gefunden"}.get(overall, "–")
+    overall_color = colors.HexColor(sc.get(overall, "#1a1a18"))
 
-    # Preview-Bild als base64
-    preview_html = ""
+    def ps(name, **kw):
+        return ParagraphStyle(name, fontName='Helvetica', fontSize=9, **kw)
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            rightMargin=20*mm, leftMargin=20*mm,
+                            topMargin=18*mm, bottomMargin=18*mm)
+    story = []
+
+    # ── Header ──
+    story.append(Paragraph(
+        '<font size="8" color="#9a9a94">PRE PRODUCTION SERVICE · DCP</font>',
+        ps('brand', spaceAfter=4)))
+    story.append(Paragraph("Analyse-Report",
+        ps('title', fontSize=22, fontName='Helvetica-Bold',
+           textColor=colors.HexColor('#1a1a18'), spaceAfter=4)))
+    story.append(Paragraph(now, ps('date', fontSize=9,
+           textColor=colors.HexColor('#9a9a94'), spaceAfter=10)))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor('#d0cdc4'), spaceAfter=12))
+
+    # ── Status Banner ──
+    banner = Table([[
+        Paragraph('<font size="12"><b>' + status_label + '</b></font><br/>'
+                  '<font size="8" color="#9a9a94">' + (filename or "–") + '</font>',
+                  ps('banner'))
+    ]], colWidths=[170*mm])
+    banner.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 10),
+        ('RIGHTPADDING', (0,0), (-1,-1), 10),
+        ('TOPPADDING', (0,0), (-1,-1), 8),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+        ('BACKGROUND', (0,0), (-1,-1), colors.white),
+        ('LINEBEFORE', (0,0), (0,-1), 3, overall_color),
+    ]))
+    story.append(banner)
+    story.append(Spacer(1, 10))
+
+    # ── Preview ──
     if preview_bytes:
-        b64 = base64.b64encode(preview_bytes).decode()
-        preview_html = f'''
-        <div class="preview-wrap">
-          <img class="preview-img" src="data:image/jpeg;base64,{b64}" />
-        </div>'''
+        try:
+            from PIL import Image as PILImg
+            pil_img = PILImg.open(_io.BytesIO(preview_bytes))
+            pw, ph = pil_img.size
+            max_w = 140*mm
+            max_h = 80*mm
+            ratio = min(max_w/pw, max_h/ph)
+            disp_w = pw * ratio
+            disp_h = ph * ratio
+            rl_img = RLImage(_io.BytesIO(preview_bytes), width=disp_w, height=disp_h)
+            preview_table = Table([[rl_img]], colWidths=[170*mm])
+            preview_table.setStyle(TableStyle([
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('BACKGROUND', (0,0), (-1,-1), colors.white),
+                ('TOPPADDING', (0,0), (-1,-1), 8),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ]))
+            story.append(preview_table)
+            story.append(Spacer(1, 10))
+        except Exception:
+            pass
 
-    # Checks HTML
-    checks_html = ""
-    if result_data and result_data.get("checks"):
-        for c in result_data["checks"]:
-            s = c.get("status", "ok")
-            color = status_colors.get(s, "#1a1a18")
-            icon = status_icons.get(s, "·")
-            label = c.get("label", "").upper()
-            value = c.get("value", "–")
-            note = c.get("note", "")
+    # ── Meta ──
+    meta_data = [
+        ["Auftragsname", job_name or "–", "Druckgröße", f"{print_w:.0f} × {print_h:.0f} mm"],
+        ["Datei", (filename or "–")[:40], "Maßstab", f"1:{scale_val}"],
+    ]
+    meta_t = Table(meta_data, colWidths=[28*mm, 57*mm, 28*mm, 57*mm])
+    meta_t.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
+        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
+        ('FONTNAME', (2,0), (2,-1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 8),
+        ('TEXTCOLOR', (0,0), (0,-1), colors.HexColor('#9a9a94')),
+        ('TEXTCOLOR', (2,0), (2,-1), colors.HexColor('#9a9a94')),
+        ('TEXTCOLOR', (1,0), (1,-1), colors.HexColor('#1a1a18')),
+        ('TEXTCOLOR', (3,0), (3,-1), colors.HexColor('#1a1a18')),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('ROWBACKGROUNDS', (0,0), (-1,-1), [colors.HexColor('#faf8f5'), colors.white]),
+        ('BACKGROUND', (0,0), (-1,-1), colors.white),
+        ('LINEBELOW', (0,0), (-1,-2), 0.3, colors.HexColor('#ece9e2')),
+    ]))
+    story.append(meta_t)
+    story.append(Spacer(1, 14))
 
-            # Details (Bildauflösung etc.)
-            details_html = ""
-            det = c.get("details", {})
-            imgs = det.get("images", [])
-            if imgs:
-                details_html = '<div class="det-list">'
-                for img in imgs:
-                    dpi = img.get("dpi_at_1to1", 0)
-                    dcls = "err" if dpi < 25 else ("warn" if dpi < 50 else "ok")
-                    dcol = status_colors.get(dcls, "#1a1a18")
-                    details_html += f'''<div class="det-row">
-                        <span class="det-dpi" style="color:{dcol}">{dpi:.1f} DPI</span>
-                        <span class="det-info">{img.get("width",0)}×{img.get("height",0)}px
-                        · {img.get("colorspace","?")} · {dpi:.1f} DPI@1:1</span>
-                    </div>'''
-                details_html += "</div>"
+    # ── Checks ──
+    story.append(Paragraph("PRÜFERGEBNISSE",
+        ps('ch', fontSize=8, fontName='Helvetica-Bold',
+           textColor=colors.HexColor('#9a9a94'), spaceAfter=6,
+           letterSpacing=1)))
 
-            checks_html += f'''
-            <div class="check-row">
-              <div class="check-icon" style="color:{color}">{icon}</div>
-              <div class="check-body">
-                <div class="check-label">{label}</div>
-                <div class="check-value">{value}</div>
-                <div class="check-note">{note}</div>
-                {details_html}
-              </div>
-            </div>'''
+    checks = result_data.get("checks", []) if result_data else []
+    for c in checks:
+        s = c.get("status", "ok")
+        color = sc.get(s, "#1a1a18")
+        icon = si.get(s, "·")
+        label = c.get("label", "").upper()
+        value = c.get("value", "–")
+        note = c.get("note", "")
 
-    # Korrekturen
-    fixes_html = ""
+        # Details (Bilder)
+        det_content = ""
+        imgs = c.get("details", {}).get("images", [])
+        det_rows = []
+        for img in imgs:
+            dpi = img.get("dpi_at_1to1", 0)
+            dcls = "error" if dpi < 25 else ("warn" if dpi < 50 else "ok")
+            dcol = sc.get(dcls, "#1a1a18")
+            det_rows.append([
+                Paragraph(f'<font color="{dcol}"><b>{dpi:.1f} DPI</b></font>',
+                          ps('di', fontSize=8)),
+                Paragraph(f'{img.get("width",0)}×{img.get("height",0)}px · '
+                          f'{img.get("colorspace","?")} · {dpi:.1f} DPI@1:1',
+                          ps('dn', fontSize=8, textColor=colors.HexColor('#9a9a94'))),
+            ])
+
+        body_content = [
+            Paragraph(label, ps('cl', fontSize=8, fontName='Helvetica-Bold',
+                                textColor=colors.HexColor('#9a9a94'))),
+            Paragraph(f'<b>{value}</b>',
+                      ps('cv', fontSize=11, textColor=colors.HexColor('#1a1a18'),
+                         spaceAfter=2)),
+            Paragraph(note, ps('cn', fontSize=8,
+                               textColor=colors.HexColor('#9a9a94'), leading=11)),
+        ]
+        if det_rows:
+            dt = Table(det_rows, colWidths=[22*mm, 120*mm])
+            dt.setStyle(TableStyle([
+                ('FONTSIZE', (0,0), (-1,-1), 8),
+                ('TOPPADDING', (0,0), (-1,-1), 2),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f5f3ee')),
+                ('LINEBELOW', (0,0), (-1,-2), 0.3, colors.HexColor('#ebe9e2')),
+            ]))
+            body_content.append(Spacer(1, 4))
+            body_content.append(dt)
+
+        row = Table([
+            [Paragraph(f'<font color="{color}"><b>{icon}</b></font>',
+                       ps('ic', fontSize=13)),
+             body_content]
+        ], colWidths=[8*mm, 152*mm])
+        row.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('TOPPADDING', (0,0), (-1,-1), 8),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ('LEFTPADDING', (0,0), (-1,-1), 6),
+            ('RIGHTPADDING', (0,0), (-1,-1), 6),
+            ('BACKGROUND', (0,0), (-1,-1), colors.white),
+            ('LINEBELOW', (0,0), (-1,-1), 0.3, colors.HexColor('#f0ede6')),
+        ]))
+        story.append(KeepTogether(row))
+
+    # ── Korrekturen ──
     if fixes_applied:
-        fixes_html = '<div class="fixes-row"><span class="fixes-label">KORREKTUREN</span> '
-        fixes_html += ' &middot; '.join(f'<span class="fix-item">{f}</span>' for f in fixes_applied)
-        fixes_html += '</div>'
+        story.append(Spacer(1, 10))
+        fixes_t = Table([[
+            Paragraph('<b><font color="#2d6a3f">KORREKTUREN</font></b>',
+                      ps('fl', fontSize=8)),
+            Paragraph(' · '.join(fixes_applied),
+                      ps('fi', fontSize=8, textColor=colors.HexColor('#2d6a3f'))),
+        ]], colWidths=[30*mm, 140*mm])
+        fixes_t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#e8f4ec')),
+            ('TOPPADDING', (0,0), (-1,-1), 8),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ('LEFTPADDING', (0,0), (-1,-1), 10),
+        ]))
+        story.append(fixes_t)
 
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  @page {{ size: A4; margin: 18mm 20mm 18mm 20mm; }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
-         background: #f5f3ee; color: #1a1a18; font-size: 11px; }}
+    # ── Footer ──
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor('#d0cdc4')))
+    story.append(Paragraph(
+        f"PPS Version //A_1.9 · Pre Production Service · DCP · {now}",
+        ps('ft', fontSize=7, textColor=colors.HexColor('#9a9a94'),
+           alignment=TA_CENTER, spaceBefore=6)))
 
-  .page {{ background: #f5f3ee; padding: 0; }}
-
-  /* Header */
-  .header {{ padding: 20px 0 12px; border-bottom: 1px solid #d0cdc4; margin-bottom: 16px; }}
-  .header-top {{ display: flex; justify-content: space-between; align-items: flex-end; }}
-  .brand {{ font-size: 9px; font-weight: 600; letter-spacing: 2px;
-            color: #9a9a94; text-transform: uppercase; }}
-  .title {{ font-size: 22px; font-weight: 700; color: #1a1a18;
-            letter-spacing: -0.5px; margin-top: 4px; }}
-  .date {{ font-size: 9px; color: #9a9a94; }}
-
-  /* Status Banner */
-  .status-banner {{ background: white; border-left: 3px solid {overall_color};
-                    padding: 10px 14px; margin-bottom: 16px; border-radius: 0 4px 4px 0; }}
-  .status-text {{ font-size: 12px; font-weight: 600; color: {overall_color}; }}
-  .status-sub {{ font-size: 9px; color: #9a9a94; margin-top: 2px; }}
-
-  /* Preview */
-  .preview-wrap {{ background: white; padding: 12px; margin-bottom: 16px;
-                   border-radius: 4px; text-align: center; }}
-  .preview-img {{ max-height: 140px; max-width: 100%; object-fit: contain;
-                  border: 1px solid #e0ddd6; }}
-
-  /* Meta */
-  .meta-grid {{ display: grid; grid-template-columns: 1fr 1fr;
-                gap: 0; background: white; border-radius: 4px;
-                overflow: hidden; margin-bottom: 16px; }}
-  .meta-item {{ padding: 8px 12px; border-bottom: 1px solid #f0ede6; }}
-  .meta-item:nth-child(odd) {{ background: #faf8f5; }}
-  .meta-key {{ font-size: 8px; font-weight: 600; color: #9a9a94;
-               text-transform: uppercase; letter-spacing: 0.5px; }}
-  .meta-val {{ font-size: 11px; color: #1a1a18; margin-top: 2px; font-weight: 500; }}
-
-  /* Checks */
-  .checks-title {{ font-size: 8px; font-weight: 700; color: #9a9a94;
-                   letter-spacing: 2px; text-transform: uppercase;
-                   margin-bottom: 8px; }}
-  .check-row {{ display: flex; background: white; border-bottom: 1px solid #f0ede6;
-                padding: 10px 12px; gap: 10px; page-break-inside: avoid; }}
-  .check-row:first-of-type {{ border-radius: 4px 4px 0 0; }}
-  .check-row:last-of-type {{ border-radius: 0 0 4px 4px; border-bottom: none; }}
-  .check-icon {{ font-size: 14px; font-weight: 700; width: 18px;
-                 flex-shrink: 0; margin-top: 1px; }}
-  .check-body {{ flex: 1; }}
-  .check-label {{ font-size: 8px; font-weight: 600; color: #9a9a94;
-                  text-transform: uppercase; letter-spacing: 0.5px; }}
-  .check-value {{ font-size: 11px; font-weight: 600; color: #1a1a18;
-                  margin-top: 2px; }}
-  .check-note {{ font-size: 9px; color: #9a9a94; margin-top: 3px; line-height: 1.4; }}
-
-  /* Details */
-  .det-list {{ margin-top: 6px; background: #f5f3ee; border-radius: 3px;
-               padding: 6px 8px; }}
-  .det-row {{ display: flex; gap: 8px; padding: 2px 0;
-              border-bottom: 1px solid #ebe9e2; font-size: 9px; }}
-  .det-row:last-child {{ border-bottom: none; }}
-  .det-dpi {{ font-weight: 700; min-width: 55px; }}
-  .det-info {{ color: #9a9a94; }}
-
-  /* Fixes */
-  .fixes-row {{ background: #e8f4ec; border-radius: 4px; padding: 8px 12px;
-                margin-top: 12px; font-size: 9px; }}
-  .fixes-label {{ font-weight: 700; color: #2d6a3f; margin-right: 6px; }}
-  .fix-item {{ color: #2d6a3f; }}
-
-  /* Footer */
-  .footer {{ margin-top: 20px; padding-top: 10px; border-top: 1px solid #d0cdc4;
-             font-size: 8px; color: #9a9a94; text-align: center; }}
-</style>
-</head>
-<body>
-<div class="page">
-
-  <div class="header">
-    <div class="brand">Pre Production Service · DCP</div>
-    <div class="header-top">
-      <div class="title">Analyse-Report</div>
-      <div class="date">{now}</div>
-    </div>
-  </div>
-
-  <div class="status-banner">
-    <div class="status-text">{status_label}</div>
-    <div class="status-sub">{filename or "–"}</div>
-  </div>
-
-  {preview_html}
-
-  <div class="meta-grid">
-    <div class="meta-item">
-      <div class="meta-key">Auftragsname</div>
-      <div class="meta-val">{job_name or "–"}</div>
-    </div>
-    <div class="meta-item">
-      <div class="meta-key">Datei</div>
-      <div class="meta-val">{filename or "–"}</div>
-    </div>
-    <div class="meta-item">
-      <div class="meta-key">Druckgröße</div>
-      <div class="meta-val">{print_w:.0f} × {print_h:.0f} mm</div>
-    </div>
-    <div class="meta-item">
-      <div class="meta-key">Maßstab</div>
-      <div class="meta-val">1:{scale_val}</div>
-    </div>
-  </div>
-
-  <div class="checks-title">Prüfergebnisse</div>
-  {checks_html}
-
-  {fixes_html}
-
-  <div class="footer">
-    PPS Version //A_1.8 &nbsp;·&nbsp; Pre Production Service &nbsp;·&nbsp; DCP &nbsp;·&nbsp; {now}
-  </div>
-
-</div>
-</body>
-</html>"""
-
-    pdf_bytes = HTML(string=html_content).write_pdf()
-    return pdf_bytes
+    doc.build(story)
+    return buf.getvalue()
 
 
 @app.post("/report")
@@ -1543,7 +1544,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.9.0"}
+    return {"status": "ok", "service": "PPS API", "version": "1.9.1"}
 
 if __name__ == "__main__":
     import uvicorn
