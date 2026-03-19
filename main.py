@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.8.3
+Backend API · Version 1.8.5
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.8.3")
+app = FastAPI(title="PPS API", version="1.8.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,29 +77,29 @@ async def fix_pdf(
 
     upscaled_count = 0
 
-    # Analyse für Report
+    # Analyse für Report (auf Original)
     try:
         analysis_result = run_analysis(doc, data, print_width_mm, print_height_mm,
                                        scale, "", file.filename)
     except Exception:
         analysis_result = None
 
-    # Schritt 1: Bleed + Cropmarks fixen (auf Original-Dokument)
+    # Schritt 1: Upscaling ZUERST auf Original-PDF (bevor Bleed-Fix die Struktur ändert)
+    if fix_resolution:
+        upscaled_bytes, upscaled_count = upscale_images_in_pdf(doc, scale)
+        if upscaled_bytes:
+            doc.close()
+            doc = fitz.open(stream=upscaled_bytes, filetype="pdf")
+
+    # Schritt 2: Bleed + Cropmarks fixen
     fixed_pdf, fixes_applied = apply_fixes(
         doc, data, print_width_mm, print_height_mm, scale,
         fix_cropmarks, fix_bleed, fix_colorspace
     )
     doc.close()
 
-    # Schritt 2: Upscaling direkt im PDF via pikepdf (KEIN Rasterisieren)
-    # Vektoren, Text und andere Elemente bleiben unberührt
-    if fix_resolution:
-        doc2 = fitz.open(stream=fixed_pdf, filetype="pdf")
-        upscaled_bytes, upscaled_count = upscale_images_in_pdf(doc2, scale)
-        doc2.close()
-        if upscaled_bytes:
-            fixed_pdf = upscaled_bytes
-            fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
+    if upscaled_count > 0:
+        fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
 
     import zipfile
     import io as _zip_io
@@ -976,9 +976,11 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         new_page = new_doc.new_page(width=new_w, height=new_h)
 
         # Original-Vektorinhalt in die Mitte
+        # keep=True verhindert dass PyMuPDF eigene Rahmen hinzufügt
         new_page.show_pdf_page(
             fitz.Rect(B, B, B + W, B + H), doc, 0,
-            clip=fitz.Rect(cx0, cy0, cx1, cy1)
+            clip=fitz.Rect(cx0, cy0, cx1, cy1),
+            keep_proportion=False
         )
 
         # Nur die Randstreifen als Pixmaps einfügen
@@ -1415,7 +1417,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.8.3"}
+    return {"status": "ok", "service": "PPS API", "version": "1.8.5"}
 
 if __name__ == "__main__":
     import uvicorn
