@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.8.5
+Backend API · Version 1.8.7
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.8.5")
+app = FastAPI(title="PPS API", version="1.8.7")
 
 app.add_middleware(
     CORSMiddleware,
@@ -729,12 +729,27 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     for item in to_upscale:
         try:
             img = Image.open(_io.BytesIO(item["bytes"]))
-            if img.mode not in ('RGB', 'CMYK', 'L'):
-                img = img.convert('RGB')
+            original_mode = img.mode
 
             new_w = int(item["w"] * item["factor"])
             new_h = int(item["h"] * item["factor"])
-            img_up = img.resize((new_w, new_h), Image.LANCZOS)
+
+            # Modus beibehalten für JPEG-Kompatibilität
+            if img.mode == 'L':
+                # Graustufen → als L hochrechnen, dann als JPEG speichern
+                img_up = img.resize((new_w, new_h), Image.LANCZOS)
+                # JPEG unterstützt kein L direkt → RGB konvertieren
+                img_up = img_up.convert('RGB')
+                cs_name = "/DeviceRGB"
+            elif img.mode == 'CMYK':
+                img_up = img.resize((new_w, new_h), Image.LANCZOS)
+                cs_name = "/DeviceCMYK"
+            elif img.mode == 'RGB':
+                img_up = img.resize((new_w, new_h), Image.LANCZOS)
+                cs_name = "/DeviceRGB"
+            else:
+                img_up = img.convert('RGB').resize((new_w, new_h), Image.LANCZOS)
+                cs_name = "/DeviceRGB"
 
             out_buf = _io.BytesIO()
             img_up.save(out_buf, format="JPEG", quality=95)
@@ -751,13 +766,15 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                     if obj_w == item["w"] and obj_h == item["h"]:
                         cs = obj.get("/ColorSpace", pikepdf.Name("/DeviceRGB"))
                         # Neuen Stream mit make_stream erstellen — korrekte pikepdf Methode
+                        # Nutze cs_name wenn Modus konvertiert wurde
+                        final_cs = pikepdf.Name(cs_name) if 'cs_name' in dir() else cs
                         new_stream = pdf_pk.make_stream(
                             new_jpeg,
                             Type=pikepdf.Name("/XObject"),
                             Subtype=pikepdf.Name("/Image"),
                             Width=new_w,
                             Height=new_h,
-                            ColorSpace=cs,
+                            ColorSpace=final_cs,
                             BitsPerComponent=8,
                             Filter=pikepdf.Name("/DCTDecode"),
                         )
@@ -976,11 +993,10 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         new_page = new_doc.new_page(width=new_w, height=new_h)
 
         # Original-Vektorinhalt in die Mitte
-        # keep=True verhindert dass PyMuPDF eigene Rahmen hinzufügt
+        # Seite zuerst auf clip_rect zuschneiden damit keine Rand-Artefakte entstehen
+        page.set_cropbox(fitz.Rect(cx0, cy0, cx1, cy1))
         new_page.show_pdf_page(
-            fitz.Rect(B, B, B + W, B + H), doc, 0,
-            clip=fitz.Rect(cx0, cy0, cx1, cy1),
-            keep_proportion=False
+            fitz.Rect(B, B, B + W, B + H), doc, 0
         )
 
         # Nur die Randstreifen als Pixmaps einfügen
@@ -1417,7 +1433,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.8.5"}
+    return {"status": "ok", "service": "PPS API", "version": "1.8.7"}
 
 if __name__ == "__main__":
     import uvicorn
