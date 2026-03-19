@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.8.8
+Backend API · Version 1.8.9
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.8.8")
+app = FastAPI(title="PPS API", version="1.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,6 +110,22 @@ async def fix_pdf(
 
     # Report generieren
     try:
+        # Preview-Bild der Originalseite generieren
+        try:
+            prev_doc = fitz.open(stream=data, filetype="pdf")
+            prev_page = prev_doc[0]
+            prev_mat = fitz.Matrix(0.5, 0.5)
+            prev_pix = prev_page.get_pixmap(matrix=prev_mat, alpha=False)
+            import io as _prev_io
+            prev_buf = _prev_io.BytesIO()
+            from PIL import Image as _PrevImg
+            _PrevImg.frombytes("RGB", (prev_pix.width, prev_pix.height),
+                               prev_pix.samples).save(prev_buf, format="JPEG", quality=80)
+            preview_bytes = prev_buf.getvalue()
+            prev_doc.close()
+        except Exception:
+            preview_bytes = None
+
         report_bytes = _generate_report_bytes(
             result_data=analysis_result,
             filename=file.filename,
@@ -118,7 +134,8 @@ async def fix_pdf(
             print_h=print_height_mm,
             scale=scale,
             fixes_applied=fixes_applied,
-            scale_val=scale
+            scale_val=scale,
+            preview_bytes=preview_bytes
         )
     except Exception:
         report_bytes = None
@@ -1164,117 +1181,208 @@ def delete_user(email: str, admin_email: str, admin_password: str):
 #  ANALYSE-REPORT ALS PDF
 # ─────────────────────────────────────────────
 def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, scale,
-                            fixes_applied=None, fixed_pdf_bytes=None, scale_val=1):
-    """Generiert Report-PDF als bytes. Wird intern und vom /report Endpoint genutzt."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.units import mm
-    from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-    from reportlab.lib.enums import TA_CENTER
+                            fixes_applied=None, scale_val=1, preview_bytes=None):
+    """Generiert Report-PDF via WeasyPrint — exakt im Look der HTML-Analyse."""
+    from weasyprint import HTML, CSS
+    import base64
     import io as _io
     from datetime import datetime
 
-    buf = _io.BytesIO()
-    pdf = SimpleDocTemplate(buf, pagesize=A4,
-                            rightMargin=20*mm, leftMargin=20*mm,
-                            topMargin=20*mm, bottomMargin=20*mm)
-    story = []
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-    def ps(name, **kw):
-        return ParagraphStyle(name, **kw)
-
-    h1 = ps('h1', fontSize=20, fontName='Helvetica-Bold', spaceAfter=4,
-             textColor=colors.HexColor('#1a1a18'))
-    sub = ps('sub', fontSize=9, fontName='Helvetica',
-             textColor=colors.HexColor('#9a9a94'), spaceAfter=16)
-    note = ps('note', fontSize=8, fontName='Helvetica',
-              textColor=colors.HexColor('#9a9a94'), leading=11)
-    footer_s = ps('footer', fontSize=7, fontName='Helvetica',
-                  textColor=colors.HexColor('#9a9a94'), alignment=TA_CENTER)
-
-    story.append(Paragraph("PPS – Pre Production Service", h1))
-    story.append(Paragraph("Analyse-Report", sub))
-    story.append(HRFlowable(width="100%", thickness=0.5,
-                            color=colors.HexColor('#d0cdc4')))
-    story.append(Spacer(1, 12))
-
     overall = result_data.get("overall_status", "ok") if result_data else "ok"
-    status_label = {"ok": "✓ Druckfertig", "warn": "⚠ Warnungen",
-                    "error": "✕ Fehler gefunden"}.get(overall, "–")
+    status_colors = {"ok": "#2d6a3f", "warn": "#c96a10", "error": "#c0392b"}
+    status_icons  = {"ok": "✓", "warn": "!", "error": "✕"}
+    status_label  = {"ok": "Druckfertig", "warn": "Warnungen vorhanden",
+                     "error": "Fehler gefunden"}.get(overall, "–")
+    overall_color = status_colors.get(overall, "#1a1a18")
 
-    meta = [
-        ["Auftragsname", job_name or filename or "–"],
-        ["Datei", filename or "–"],
-        ["Druckgröße", f"{print_w:.0f} × {print_h:.0f} mm"],
-        ["Maßstab", f"1:{scale_val}"],
-        ["Datum", now],
-        ["Status", status_label],
-    ]
-    if fixes_applied:
-        meta.append(["Korrekturen", " · ".join(fixes_applied)])
+    # Preview-Bild als base64
+    preview_html = ""
+    if preview_bytes:
+        b64 = base64.b64encode(preview_bytes).decode()
+        preview_html = f'''
+        <div class="preview-wrap">
+          <img class="preview-img" src="data:image/jpeg;base64,{b64}" />
+        </div>'''
 
-    t = Table(meta, colWidths=[48*mm, 122*mm])
-    t.setStyle(TableStyle([
-        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
-        ('FONTNAME', (1,0), (1,-1), 'Helvetica'),
-        ('FONTSIZE', (0,0), (-1,-1), 9),
-        ('TEXTCOLOR', (0,0), (0,-1), colors.HexColor('#5a5a56')),
-        ('TEXTCOLOR', (1,0), (1,-1), colors.HexColor('#1a1a18')),
-        ('TOPPADDING', (0,0), (-1,-1), 5),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-        ('ROWBACKGROUNDS', (0,0), (-1,-1),
-         [colors.HexColor('#f5f3ee'), colors.white]),
-    ]))
-    story.append(t)
-    story.append(Spacer(1, 16))
-
+    # Checks HTML
+    checks_html = ""
     if result_data and result_data.get("checks"):
-        story.append(HRFlowable(width="100%", thickness=0.5,
-                                color=colors.HexColor('#d0cdc4')))
-        story.append(Spacer(1, 8))
-        story.append(Paragraph("PRÜFERGEBNISSE",
-            ps('h2', fontSize=9, fontName='Helvetica-Bold',
-               textColor=colors.HexColor('#9a9a94'), spaceBefore=8,
-               spaceAfter=8, letterSpacing=1)))
+        for c in result_data["checks"]:
+            s = c.get("status", "ok")
+            color = status_colors.get(s, "#1a1a18")
+            icon = status_icons.get(s, "·")
+            label = c.get("label", "").upper()
+            value = c.get("value", "–")
+            note = c.get("note", "")
 
-        sc = {"ok": '#2d6a3f', "warn": '#c96a10', "error": '#c0392b'}
-        si = {"ok": "✓", "warn": "!", "error": "✕"}
+            # Details (Bildauflösung etc.)
+            details_html = ""
+            det = c.get("details", {})
+            imgs = det.get("images", [])
+            if imgs:
+                details_html = '<div class="det-list">'
+                for img in imgs:
+                    dpi = img.get("dpi_at_1to1", 0)
+                    dcls = "err" if dpi < 25 else ("warn" if dpi < 50 else "ok")
+                    dcol = status_colors.get(dcls, "#1a1a18")
+                    details_html += f'''<div class="det-row">
+                        <span class="det-dpi" style="color:{dcol}">{dpi:.1f} DPI</span>
+                        <span class="det-info">{img.get("width",0)}×{img.get("height",0)}px
+                        · {img.get("colorspace","?")} · {dpi:.1f} DPI@1:1</span>
+                    </div>'''
+                details_html += "</div>"
 
-        for check in result_data["checks"]:
-            s = check.get("status", "ok")
-            row = [[
-                Paragraph(f'<font color="{sc.get(s,"#1a1a18")}">{si.get(s,"·")}</font>',
-                          ps('ic', fontSize=12, fontName='Helvetica-Bold')),
-                Paragraph(f'<b>{check.get("label","").upper()}</b><br/>'
-                          f'{check.get("value","–")}',
-                          ps('cv', fontSize=9, fontName='Helvetica',
-                             textColor=colors.HexColor('#1a1a18'), leading=14)),
-                Paragraph(check.get("note",""),
-                          ps('cn', fontSize=8, fontName='Helvetica',
-                             textColor=colors.HexColor('#9a9a94'), leading=11)),
-            ]]
-            ct = Table(row, colWidths=[8*mm, 60*mm, 100*mm])
-            ct.setStyle(TableStyle([
-                ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                ('TOPPADDING', (0,0), (-1,-1), 5),
-                ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-                ('LINEBELOW', (0,0), (-1,-1), 0.3,
-                 colors.HexColor('#eceae3')),
-            ]))
-            story.append(ct)
+            checks_html += f'''
+            <div class="check-row">
+              <div class="check-icon" style="color:{color}">{icon}</div>
+              <div class="check-body">
+                <div class="check-label">{label}</div>
+                <div class="check-value">{value}</div>
+                <div class="check-note">{note}</div>
+                {details_html}
+              </div>
+            </div>'''
 
-    story.append(Spacer(1, 16))
-    story.append(HRFlowable(width="100%", thickness=0.5,
-                            color=colors.HexColor('#d0cdc4')))
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(
-        f"PPS Version //A_1.8 · Pre Production Service · DCP · {now}",
-        footer_s))
+    # Korrekturen
+    fixes_html = ""
+    if fixes_applied:
+        fixes_html = '<div class="fixes-row"><span class="fixes-label">KORREKTUREN</span> '
+        fixes_html += ' &middot; '.join(f'<span class="fix-item">{f}</span>' for f in fixes_applied)
+        fixes_html += '</div>'
 
-    pdf.build(story)
-    return buf.getvalue()
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page {{ size: A4; margin: 18mm 20mm 18mm 20mm; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
+         background: #f5f3ee; color: #1a1a18; font-size: 11px; }}
+
+  .page {{ background: #f5f3ee; padding: 0; }}
+
+  /* Header */
+  .header {{ padding: 20px 0 12px; border-bottom: 1px solid #d0cdc4; margin-bottom: 16px; }}
+  .header-top {{ display: flex; justify-content: space-between; align-items: flex-end; }}
+  .brand {{ font-size: 9px; font-weight: 600; letter-spacing: 2px;
+            color: #9a9a94; text-transform: uppercase; }}
+  .title {{ font-size: 22px; font-weight: 700; color: #1a1a18;
+            letter-spacing: -0.5px; margin-top: 4px; }}
+  .date {{ font-size: 9px; color: #9a9a94; }}
+
+  /* Status Banner */
+  .status-banner {{ background: white; border-left: 3px solid {overall_color};
+                    padding: 10px 14px; margin-bottom: 16px; border-radius: 0 4px 4px 0; }}
+  .status-text {{ font-size: 12px; font-weight: 600; color: {overall_color}; }}
+  .status-sub {{ font-size: 9px; color: #9a9a94; margin-top: 2px; }}
+
+  /* Preview */
+  .preview-wrap {{ background: white; padding: 12px; margin-bottom: 16px;
+                   border-radius: 4px; text-align: center; }}
+  .preview-img {{ max-height: 140px; max-width: 100%; object-fit: contain;
+                  border: 1px solid #e0ddd6; }}
+
+  /* Meta */
+  .meta-grid {{ display: grid; grid-template-columns: 1fr 1fr;
+                gap: 0; background: white; border-radius: 4px;
+                overflow: hidden; margin-bottom: 16px; }}
+  .meta-item {{ padding: 8px 12px; border-bottom: 1px solid #f0ede6; }}
+  .meta-item:nth-child(odd) {{ background: #faf8f5; }}
+  .meta-key {{ font-size: 8px; font-weight: 600; color: #9a9a94;
+               text-transform: uppercase; letter-spacing: 0.5px; }}
+  .meta-val {{ font-size: 11px; color: #1a1a18; margin-top: 2px; font-weight: 500; }}
+
+  /* Checks */
+  .checks-title {{ font-size: 8px; font-weight: 700; color: #9a9a94;
+                   letter-spacing: 2px; text-transform: uppercase;
+                   margin-bottom: 8px; }}
+  .check-row {{ display: flex; background: white; border-bottom: 1px solid #f0ede6;
+                padding: 10px 12px; gap: 10px; page-break-inside: avoid; }}
+  .check-row:first-of-type {{ border-radius: 4px 4px 0 0; }}
+  .check-row:last-of-type {{ border-radius: 0 0 4px 4px; border-bottom: none; }}
+  .check-icon {{ font-size: 14px; font-weight: 700; width: 18px;
+                 flex-shrink: 0; margin-top: 1px; }}
+  .check-body {{ flex: 1; }}
+  .check-label {{ font-size: 8px; font-weight: 600; color: #9a9a94;
+                  text-transform: uppercase; letter-spacing: 0.5px; }}
+  .check-value {{ font-size: 11px; font-weight: 600; color: #1a1a18;
+                  margin-top: 2px; }}
+  .check-note {{ font-size: 9px; color: #9a9a94; margin-top: 3px; line-height: 1.4; }}
+
+  /* Details */
+  .det-list {{ margin-top: 6px; background: #f5f3ee; border-radius: 3px;
+               padding: 6px 8px; }}
+  .det-row {{ display: flex; gap: 8px; padding: 2px 0;
+              border-bottom: 1px solid #ebe9e2; font-size: 9px; }}
+  .det-row:last-child {{ border-bottom: none; }}
+  .det-dpi {{ font-weight: 700; min-width: 55px; }}
+  .det-info {{ color: #9a9a94; }}
+
+  /* Fixes */
+  .fixes-row {{ background: #e8f4ec; border-radius: 4px; padding: 8px 12px;
+                margin-top: 12px; font-size: 9px; }}
+  .fixes-label {{ font-weight: 700; color: #2d6a3f; margin-right: 6px; }}
+  .fix-item {{ color: #2d6a3f; }}
+
+  /* Footer */
+  .footer {{ margin-top: 20px; padding-top: 10px; border-top: 1px solid #d0cdc4;
+             font-size: 8px; color: #9a9a94; text-align: center; }}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="header">
+    <div class="brand">Pre Production Service · DCP</div>
+    <div class="header-top">
+      <div class="title">Analyse-Report</div>
+      <div class="date">{now}</div>
+    </div>
+  </div>
+
+  <div class="status-banner">
+    <div class="status-text">{status_label}</div>
+    <div class="status-sub">{filename or "–"}</div>
+  </div>
+
+  {preview_html}
+
+  <div class="meta-grid">
+    <div class="meta-item">
+      <div class="meta-key">Auftragsname</div>
+      <div class="meta-val">{job_name or "–"}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-key">Datei</div>
+      <div class="meta-val">{filename or "–"}</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-key">Druckgröße</div>
+      <div class="meta-val">{print_w:.0f} × {print_h:.0f} mm</div>
+    </div>
+    <div class="meta-item">
+      <div class="meta-key">Maßstab</div>
+      <div class="meta-val">1:{scale_val}</div>
+    </div>
+  </div>
+
+  <div class="checks-title">Prüfergebnisse</div>
+  {checks_html}
+
+  {fixes_html}
+
+  <div class="footer">
+    PPS Version //A_1.8 &nbsp;·&nbsp; Pre Production Service &nbsp;·&nbsp; DCP &nbsp;·&nbsp; {now}
+  </div>
+
+</div>
+</body>
+</html>"""
+
+    pdf_bytes = HTML(string=html_content).write_pdf()
+    return pdf_bytes
 
 
 @app.post("/report")
@@ -1435,7 +1543,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.8.8"}
+    return {"status": "ok", "service": "PPS API", "version": "1.9.0"}
 
 if __name__ == "__main__":
     import uvicorn
