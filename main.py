@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.9.3
+Backend API · Version 1.9.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.9.3")
+app = FastAPI(title="PPS API", version="1.9.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1005,42 +1005,19 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         canvas.paste(strip_b.resize((pw, bx), Image.LANCZOS), (bx, bx+ph))
         canvas.paste(corner_br.resize((bx, bx), Image.LANCZOS), (bx+pw, bx+ph))
 
-        # Neues Dokument mit erweiterter Seite
+        # Canvas-Ansatz: sauber, keine Passmarken-Artefakte
+        # Render-Auflösung: 150 DPI — gut für Großformatdruck
         new_doc = fitz.open()
         new_w = W + 2 * B
         new_h = H + 2 * B
         new_page = new_doc.new_page(width=new_w, height=new_h)
 
-        # Quelle: clip auf exakten Druckbereich — KEIN Inhalt außerhalb
-        # Temporäres Dokument mit nur dem geclippten Bereich
-        tmp_doc = fitz.open()
-        tmp_page = tmp_doc.new_page(width=W, height=H)
-        # set_cropbox/mediabox auf cx0,cy0 damit show_pdf_page korrekt mapped
-        tmp_page.show_pdf_page(
-            fitz.Rect(0, 0, W, H), doc, 0,
-            clip=fitz.Rect(cx0, cy0, cx1, cy1)
+        canvas_buf = _io.BytesIO()
+        canvas.save(canvas_buf, format="JPEG", quality=95)
+        new_page.insert_image(
+            fitz.Rect(0, 0, new_w, new_h),
+            stream=canvas_buf.getvalue()
         )
-
-        # Vektor-Inhalt aus tmp_doc in die Mitte der neuen Seite
-        new_page.show_pdf_page(
-            fitz.Rect(B, B, B + W, B + H), tmp_doc, 0
-        )
-        tmp_doc.close()
-
-        # Randstreifen als Pixel einfügen
-        def insert_strip(img, rect):
-            buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=92)
-            new_page.insert_image(rect, stream=buf.getvalue())
-
-        insert_strip(strip_l, fitz.Rect(0, B, B, B+H))
-        insert_strip(strip_r, fitz.Rect(B+W, B, B+W+B, B+H))
-        insert_strip(strip_t, fitz.Rect(B, 0, B+W, B))
-        insert_strip(strip_b, fitz.Rect(B, B+H, B+W, B+H+B))
-        insert_strip(corner_tl, fitz.Rect(0, 0, B, B))
-        insert_strip(corner_tr, fitz.Rect(B+W, 0, B+W+B, B))
-        insert_strip(corner_bl, fitz.Rect(0, B+H, B, B+H+B))
-        insert_strip(corner_br, fitz.Rect(B+W, B+H, B+W+B, B+H+B))
 
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
@@ -1212,7 +1189,9 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
     overall_color = colors.HexColor(sc.get(overall, "#1a1a18"))
 
     def ps(name, **kw):
-        return ParagraphStyle(name, fontName='Helvetica', fontSize=9, **kw)
+        defaults = {'fontName': 'Helvetica', 'fontSize': 9}
+        defaults.update(kw)
+        return ParagraphStyle(name, **defaults)
 
     buf = _io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -1553,7 +1532,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.9.3"}
+    return {"status": "ok", "service": "PPS API", "version": "1.9.4"}
 
 if __name__ == "__main__":
     import uvicorn
