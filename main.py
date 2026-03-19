@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.8.7
+Backend API · Version 1.8.8
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.8.7")
+app = FastAPI(title="PPS API", version="1.8.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -992,9 +992,11 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         new_h = H + 2 * B
         new_page = new_doc.new_page(width=new_w, height=new_h)
 
-        # Original-Vektorinhalt in die Mitte
-        # Seite zuerst auf clip_rect zuschneiden damit keine Rand-Artefakte entstehen
+        # Seite hart auf clip_rect zuschneiden — entfernt alle Artefakte außerhalb
         page.set_cropbox(fitz.Rect(cx0, cy0, cx1, cy1))
+        page.set_mediabox(fitz.Rect(cx0, cy0, cx1, cy1))
+
+        # Original-Vektorinhalt in die Mitte
         new_page.show_pdf_page(
             fitz.Rect(B, B, B + W, B + H), doc, 0
         )
@@ -1433,7 +1435,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.8.7"}
+    return {"status": "ok", "service": "PPS API", "version": "1.8.8"}
 
 if __name__ == "__main__":
     import uvicorn
