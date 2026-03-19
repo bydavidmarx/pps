@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.9.6
+Backend API · Version 1.9.8
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.9.6")
+app = FastAPI(title="PPS API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +30,27 @@ PT_TO_MM = 25.4 / 72
 # ─────────────────────────────────────────────
 #  ANALYSE ENDPOINT
 # ─────────────────────────────────────────────
+def _check_and_increment_trial(email: str):
+    """Checks trial limit for user. Raises 402 if exceeded."""
+    users = load_users()
+    if email not in users:
+        return  # admin or unknown — skip
+    user = users[email]
+    if user.get("role") != "trial":
+        return  # full user — no limit
+    used  = int(user.get("trial_analyses", 0))
+    limit = int(user.get("trial_limit", TRIAL_LIMIT))
+    if used >= limit:
+        raise HTTPException(
+            402,
+            f"Ihr Test-Kontingent ({limit} Analysen) ist aufgebraucht. "
+            "Bitte kontaktieren Sie uns fuer einen vollstaendigen Zugang: hello@studiomarx.com"
+        )
+    user["trial_analyses"] = used + 1
+    users[email] = user
+    save_users(users)
+
+
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -37,9 +58,14 @@ async def analyze(
     print_height_mm: float = Form(...),
     scale: int = Form(10),
     job_name: Optional[str] = Form(""),
+    user_email: Optional[str] = Form(""),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Nur PDF-Dateien erlaubt.")
+
+    # Trial limit check
+    if user_email:
+        _check_and_increment_trial(user_email.strip().lower())
 
     data = await file.read()
     if len(data) > 100 * 1024 * 1024:
@@ -1061,6 +1087,16 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "supersize")
 UPSTASH_URL    = os.environ.get("UPSTASH_URL", "").rstrip("/")
 UPSTASH_TOKEN  = os.environ.get("UPSTASH_TOKEN", "")
 
+# SMTP config (Railway env vars)
+SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER      = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD  = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM      = os.environ.get("SMTP_FROM", "noreply@pps.live")
+NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "hello@studiomarx.com")
+
+TRIAL_LIMIT    = int(os.environ.get("TRIAL_LIMIT", "20"))
+
 _users: dict = {}
 _loaded: bool = False
 
@@ -1113,6 +1149,94 @@ def save_users(users: dict):
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
 
 # ─────────────────────────────────────────────
+#  UPSTASH HELPERS: TRIAL STORE
+# ─────────────────────────────────────────────
+
+def _upstash_get(key: str):
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        url = f"{UPSTASH_URL}/get/{urllib.parse.quote(key)}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            return data.get("result")
+    except Exception:
+        return None
+
+def _upstash_set(key: str, value: str, ex: int = None):
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return
+    try:
+        url = f"{UPSTASH_URL}/set/{urllib.parse.quote(key)}"
+        if ex:
+            url += f"?ex={ex}"
+        req = urllib.request.Request(
+            url,
+            data=value.encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}", "Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+def _upstash_incr(key: str) -> int:
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return 0
+    try:
+        url = f"{UPSTASH_URL}/incr/{urllib.parse.quote(key)}"
+        req = urllib.request.Request(url, method="POST",
+                                     headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            return int(data.get("result", 0))
+    except Exception:
+        return 0
+
+# ─────────────────────────────────────────────
+#  SMTP E-MAIL
+# ─────────────────────────────────────────────
+import smtplib
+import random
+import string
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime as _dt
+
+def _send_email(to: str, subject: str, html: str, text: str = ""):
+    if not SMTP_USER or not SMTP_PASSWORD:
+        return False
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = f"PPS <{SMTP_FROM}>"
+        msg["To"]      = to
+        if text:
+            msg.attach(MIMEText(text, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html", "utf-8"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.sendmail(SMTP_FROM, to, msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[PPS] SMTP error: {e}")
+        return False
+
+def _gen_password(length: int = 10) -> str:
+    chars = string.ascii_letters + string.digits
+    return "".join(random.choices(chars, k=length))
+
+def _is_business_email(email: str) -> bool:
+    free = {"gmail.com","googlemail.com","yahoo.com","yahoo.de","hotmail.com",
+            "hotmail.de","outlook.com","outlook.de","web.de","gmx.de","gmx.net",
+            "icloud.com","me.com","aol.com","t-online.de","freenet.de","posteo.de"}
+    domain = email.strip().lower().split("@")[-1]
+    return domain not in free
+
+# ─────────────────────────────────────────────
 #  AUTH ENDPOINTS
 # ─────────────────────────────────────────────
 from pydantic import BaseModel
@@ -1121,6 +1245,94 @@ class UserRequest(BaseModel):
     name: str
     email: str
     password: str
+
+class TrialRequest(BaseModel):
+    name: str
+    email: str
+    company: str
+
+@app.post("/trial/request")
+def request_trial(req: TrialRequest):
+    email = req.email.strip().lower()
+    name  = req.name.strip()
+    company = req.company.strip()
+
+    # Business email check
+    if not _is_business_email(email):
+        raise HTTPException(400, "Bitte eine Business-E-Mail-Adresse verwenden.")
+
+    # Already has account?
+    users = load_users()
+    if email in users:
+        raise HTTPException(409, "Diese E-Mail-Adresse hat bereits Zugang.")
+
+    # Already requested trial?
+    existing = _upstash_get(f"trial:{email}")
+    if existing:
+        raise HTTPException(409, "Fuer diese E-Mail-Adresse wurde bereits ein Test-Zugang angefragt.")
+
+    # Generate credentials
+    password = _gen_password(10)
+    now_str  = _dt.now().strftime("%d.%m.%Y %H:%M")
+
+    # Save as trial user (with limit tracking)
+    users[email] = {
+        "name":     name,
+        "password": password,
+        "role":     "trial",
+        "company":  company,
+        "trial_analyses": 0,
+        "trial_limit":    TRIAL_LIMIT,
+        "created":  now_str,
+    }
+    save_users(users)
+
+    # Mark trial requested in Upstash (90 days TTL)
+    _upstash_set(f"trial:{email}", json.dumps({"name": name, "company": company, "created": now_str}), ex=7776000)
+
+    # Send welcome email to user
+    welcome_html = f"""
+    <div style="font-family:'DM Mono',monospace;max-width:520px;margin:0 auto;padding:2rem;color:#1a1a18">
+      <div style="margin-bottom:2rem">
+        <strong style="font-size:18px">PPS</strong>
+        <span style="font-size:10px;color:#9a9a94;letter-spacing:.1em;margin-left:.75rem;text-transform:uppercase">Pre Production Service</span>
+      </div>
+      <h2 style="font-family:'Instrument Serif',Georgia,serif;font-size:1.75rem;margin-bottom:1rem">Willkommen, {name}.</h2>
+      <p style="font-size:14px;color:#5a5a56;line-height:1.7;margin-bottom:1.5rem">
+        Ihr Test-Zugang fuer PPS XPRESS ist bereit. Sie haben <strong>{TRIAL_LIMIT} Analysen</strong> zur freien Verfuegung.
+      </p>
+      <div style="background:#f5f3ee;border:1px solid #d0cdc4;border-radius:4px;padding:1.5rem;margin-bottom:1.5rem">
+        <div style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#9a9a94;margin-bottom:.75rem">Ihre Zugangsdaten</div>
+        <div style="margin-bottom:.5rem"><span style="color:#9a9a94">E-Mail:</span> {email}</div>
+        <div><span style="color:#9a9a94">Zugangscode:</span> <strong>{password}</strong></div>
+      </div>
+      <a href="https://studiomarx.com/pps.html" style="display:inline-block;background:#1a1a18;color:white;padding:12px 24px;border-radius:2px;text-decoration:none;font-size:12px;letter-spacing:.1em;text-transform:uppercase">
+        PPS XPRESS starten &rarr;
+      </a>
+      <p style="margin-top:2rem;font-size:11px;color:#9a9a94;line-height:1.6">
+        Nach {TRIAL_LIMIT} Analysen koennen Sie einfach Kontakt aufnehmen, um einen vollstaendigen Zugang zu erhalten.<br>
+        <a href="mailto:hello@studiomarx.com" style="color:#2d5a3d">hello@studiomarx.com</a>
+      </p>
+      <div style="margin-top:2rem;padding-top:1.5rem;border-top:1px solid #d0cdc4;font-size:10px;color:#9a9a94;letter-spacing:.06em">
+        PPS XPRESS &mdash; Studio M LDA &middot; DSGVO-konform &middot; Keine Datenspeicherung
+      </div>
+    </div>"""
+
+    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)
+
+    # Notify studio
+    notify_html = f"""
+    <div style="font-family:monospace;padding:1.5rem;color:#1a1a18">
+      <strong>Neue Trial-Anfrage</strong><br><br>
+      Name: {name}<br>
+      Firma: {company}<br>
+      E-Mail: {email}<br>
+      Passwort: {password}<br>
+      Zeitpunkt: {now_str}
+    </div>"""
+    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)
+
+    return {"success": True, "message": f"Test-Zugang fuer {email} angelegt. Bitte E-Mail pruefen."}
 
 @app.post("/login")
 def login(
