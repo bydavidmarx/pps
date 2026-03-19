@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.9.1
+Backend API · Version 1.9.2
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="1.9.1")
+app = FastAPI(title="PPS API", version="1.9.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1002,36 +1002,21 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         canvas.paste(strip_b.resize((pw, bx), Image.LANCZOS), (bx, bx+ph))
         canvas.paste(corner_br.resize((bx, bx), Image.LANCZOS), (bx+pw, bx+ph))
 
-        # Als PDF exportieren — aber NUR die Randstreifen als Pixel
-        # Die Mitte bleibt als Vektor
+        # Vollständiges Bild als PDF speichern
+        # canvas enthält bereits das komplette Bild mit Randspiegelung
+        # Konvertiere canvas zu PDF mit korrekter physischer Größe
         new_doc = fitz.open()
         new_w = W + 2 * B
         new_h = H + 2 * B
         new_page = new_doc.new_page(width=new_w, height=new_h)
 
-        # Seite hart auf clip_rect zuschneiden — entfernt alle Artefakte außerhalb
-        page.set_cropbox(fitz.Rect(cx0, cy0, cx1, cy1))
-        page.set_mediabox(fitz.Rect(cx0, cy0, cx1, cy1))
-
-        # Original-Vektorinhalt in die Mitte
-        new_page.show_pdf_page(
-            fitz.Rect(B, B, B + W, B + H), doc, 0
+        # Canvas als JPEG in die neue Seite einbetten
+        canvas_buf = _io.BytesIO()
+        canvas.save(canvas_buf, format="JPEG", quality=95)
+        new_page.insert_image(
+            fitz.Rect(0, 0, new_w, new_h),
+            stream=canvas_buf.getvalue()
         )
-
-        # Nur die Randstreifen als Pixmaps einfügen
-        def insert_strip(img, rect):
-            buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=92)
-            new_page.insert_image(rect, stream=buf.getvalue())
-
-        insert_strip(strip_l, fitz.Rect(0, B, B, B+H))
-        insert_strip(strip_r, fitz.Rect(B+W, B, B+W+B, B+H))
-        insert_strip(strip_t, fitz.Rect(B, 0, B+W, B))
-        insert_strip(strip_b, fitz.Rect(B, B+H, B+W, B+H+B))
-        insert_strip(corner_tl, fitz.Rect(0, 0, B, B))
-        insert_strip(corner_tr, fitz.Rect(B+W, 0, B+W+B, B))
-        insert_strip(corner_bl, fitz.Rect(0, B+H, B, B+H+B))
-        insert_strip(corner_br, fitz.Rect(B+W, B+H, B+W+B, B+H+B))
 
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
@@ -1544,7 +1529,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.9.1"}
+    return {"status": "ok", "service": "PPS API", "version": "1.9.2"}
 
 if __name__ == "__main__":
     import uvicorn
