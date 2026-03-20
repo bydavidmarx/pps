@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3
+Backend API · Version 2.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -1867,7 +1867,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "1.9.6"}
+    return {"status": "ok", "service": "PPS API", "version": "2.1.2"}
 
 if __name__ == "__main__":
     import uvicorn
