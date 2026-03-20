@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.2
+Backend API · Version 2.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.1.1")
+app = FastAPI(title="PPS API", version="2.1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -189,11 +189,13 @@ async def fix_pdf(
             scale_val=scale,
             preview_bytes=preview_bytes
         )
+        if report_bytes:
+            print(f"[PPS] report generated: {len(report_bytes)} bytes", file=sys.stderr)
         del preview_bytes
         gc.collect()
     except Exception as _rep_err:
-        import sys, traceback
-        print(f"[PPS] report error: {_rep_err}", file=sys.stderr)
+        import traceback
+        print(f"[PPS] report error: {type(_rep_err).__name__}: {_rep_err}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         report_bytes = None
 
@@ -1161,6 +1163,7 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 # ─────────────────────────────────────────────
 import json
 import os
+import sys
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -1596,7 +1599,7 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
         color = sc.get(s, "#1a1a18")
         icon = si.get(s, "·")
         label = c.get("label", "").upper()
-        value = c.get("value", "–")
+        value = c.get("value") or "–"
         note = c.get("note") or ""
 
         # Details (Bilder)
@@ -1681,14 +1684,16 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
             ])
 
         fixes_t = Table(rows, colWidths=[30*mm, 140*mm])
-        fixes_t.setStyle(TableStyle([
+        _fix_styles = [
             ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#e8f4ec')),
-            ('BACKGROUND', (0, len(normal)), (-1,-1), colors.HexColor('#fdecea')),
             ('TOPPADDING', (0,0), (-1,-1), 7),
             ('BOTTOMPADDING', (0,0), (-1,-1), 7),
             ('LEFTPADDING', (0,0), (-1,-1), 10),
             ('LINEBELOW', (0,0), (-1,-2), 0.3, colors.HexColor('#d0cdc4')),
-        ]))
+        ]
+        if normal and warnings:
+            _fix_styles.append(('BACKGROUND', (0, len(normal)), (-1,-1), colors.HexColor('#fdecea')))
+        fixes_t.setStyle(TableStyle(_fix_styles))
         story.append(fixes_t)
 
     # ── Footer ──
