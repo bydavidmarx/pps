@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.0.1")
+app = FastAPI(title="PPS API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,8 +164,8 @@ async def fix_pdf(
                 bad = [i for i in imgs if i.get("dpi_at_1to1", 0) < 25]
                 if bad:
                     fixes_applied.append(
-                        f"{len(bad)} Bild(er) unter 25 DPI — "
-                        f"zu niedrig fuer Upscaling, Originaldatei erforderlich"
+                        f"Hinweis: {len(bad)} Bild(er) unter 25 DPI wurden hochgerechnet "
+                        f"— Druckqualitaet koennte beeintraechtigt sein"
                     )
 
     import zipfile
@@ -357,20 +357,13 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
         "details": {"images": images, "min_dpi": round(min_dpi_doc, 1), "critical_dpi": round(critical_dpi, 1)}
     })
 
-    # 6. File size
-    expected_min = (print_w / 1000) * (print_h / 1000) * 0.4
-    fs_status = "ok"
-    if file_size_mb < expected_min and len(images) > 0:
-        fs_status = "warn"
-    elif file_size_mb > 150:
-        fs_status = "warn"
+    # 6. File size — nur anzeigen, nicht bewerten (Punkt 5 Feedback)
     checks.append({
         "id": "filesize",
         "label": "Dateigröße",
-        "status": fs_status,
+        "status": "ok",
         "value": f"{file_size_mb:.2f} MB",
-        "note": f"Plausibel für {print_w/1000:.1f}×{print_h/1000:.1f} m Druck." if fs_status == "ok"
-                else f"{file_size_mb:.1f} MB ist {'gering' if file_size_mb < expected_min else 'sehr groß'} für dieses Format.",
+        "note": None,
         "fixable": False,
         "details": {"size_mb": round(file_size_mb, 2)}
     })
@@ -492,17 +485,17 @@ def analyze_images(page, doc, print_w_mm, print_h_mm, scale):
                     dpi_x = img_w_px / (placed_w_mm / 25.4)
                     dpi_y = img_h_px / (placed_h_mm / 25.4)
                     dpi_effective = min(dpi_x, dpi_y)
-                    # Bei 1:10: 300 DPI im Dokument = 30 DPI im Druck (1:1)
                     dpi_at_1to1 = dpi_effective / scale
                 else:
                     dpi_effective = 0
                     dpi_at_1to1 = 0
+                bbox = [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)]
             else:
-                # Fallback: estimate from page coverage
                 page_w_mm = page.rect.width * PT_TO_MM
                 page_h_mm = page.rect.height * PT_TO_MM
                 dpi_effective = min(img_w_px / (page_w_mm / 25.4), img_h_px / (page_h_mm / 25.4))
                 dpi_at_1to1 = dpi_effective / scale
+                bbox = None
 
             images.append({
                 "xref": xref,
@@ -512,6 +505,7 @@ def analyze_images(page, doc, print_w_mm, print_h_mm, scale):
                 "dpi_at_1to1": round(dpi_at_1to1, 1),
                 "colorspace": cs_name,
                 "size_kb": round(len(base_image.get("image", b"")) / 1024, 1),
+                "bbox": bbox,
             })
         except Exception as e:
             images.append({"xref": xref, "error": str(e), "dpi_in_doc": 0, "dpi_at_1to1": 0})
@@ -767,10 +761,13 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             )
             dpi_1to1 = dpi_doc / scale
 
-            if dpi_1to1 >= min_dpi_1to1 or dpi_1to1 < 25.0:
-                continue
+            if dpi_1to1 >= min_dpi_1to1:
+                continue  # bereits gut genug — kein Upscaling nötig
 
-            factor = min(100.0 / dpi_1to1, 4.0)  # Ziel: 100 DPI@1:1
+            # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
+            # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
+            target_dpi = 100.0
+            factor = min(target_dpi / dpi_1to1, 4.0)  # max 4x upscale
             to_upscale.append({
                 "xref": xref,
                 "rect": r,
