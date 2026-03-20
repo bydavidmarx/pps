@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.4
+Backend API · Version 2.5
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.2.1")
+app = FastAPI(title="PPS API", version="2.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1898,6 +1898,51 @@ async def generate_report(
     )
 
 
+
+
+# ─────────────────────────────────────────────
+#  SYSTEM BANNER ENDPOINT
+# ─────────────────────────────────────────────
+class BannerUpdate(BaseModel):
+    message: str = ""
+    type: str = "info"       # info | warn | err
+    link_text: str = ""
+    link_url: str = ""
+
+@app.get("/system/banner")
+def get_banner():
+    """Liefert die aktuelle System-Bannermeldung."""
+    raw = _upstash_get("pps_banner")
+    if not raw:
+        return {"message": "", "type": "info"}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"message": "", "type": "info"}
+
+@app.post("/system/banner")
+def set_banner(req: BannerUpdate, admin_email: str, admin_password: str):
+    """Setzt oder loescht die System-Bannermeldung (nur Admin)."""
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    if req.message:
+        _upstash_set("pps_banner", json.dumps({
+            "message": req.message,
+            "type": req.type,
+            "link_text": req.link_text,
+            "link_url": req.link_url,
+        }))
+        return {"success": True, "action": "set", "message": req.message}
+    else:
+        # Leer = Banner entfernen
+        try:
+            url = f"{UPSTASH_URL}/del/pps_banner"
+            req2 = urllib.request.Request(url, method="POST",
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"})
+            urllib.request.urlopen(req2, timeout=5)
+        except Exception:
+            pass
+        return {"success": True, "action": "cleared"}
 
 # ─────────────────────────────────────────────
 #  REPORT AN ISSUE ENDPOINT
