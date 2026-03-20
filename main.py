@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.5
+Backend API · Version 2.6
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.3.0")
+app = FastAPI(title="PPS API", version="2.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1228,7 +1228,7 @@ _loaded: bool = False
 
 def load_users() -> dict:
     global _users, _loaded
-    if _loaded:
+    if _loaded and _users:
         return _users
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         _loaded = True
@@ -1506,7 +1506,7 @@ def get_users(admin_email: str, admin_password: str):
     if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
         raise HTTPException(403, "Nicht autorisiert.")
     users = load_users()
-    return {"users": [{"email": e, "name": d["name"]} for e, d in users.items()]}
+    return {"users": [{"email": e, "name": d.get("name",""), "role": d.get("role","customer"), "company": d.get("company","")} for e, d in users.items()]}
 
 @app.post("/admin/users")
 def create_user(req: UserRequest, admin_email: str, admin_password: str):
@@ -2123,6 +2123,20 @@ def report_issue(req: IssueReport):
 # ─────────────────────────────────────────────
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
+
+@app.get("/admin/config")
+def get_admin_config(admin_email: str, admin_password: str):
+    """Returns safe admin configuration values (no passwords)."""
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    return {
+        "smtp_host": SMTP_HOST or "(nicht gesetzt)",
+        "smtp_user": SMTP_USER or "(nicht gesetzt)",
+        "notify_email": NOTIFY_EMAIL or "(nicht gesetzt)",
+        "trial_limit": TRIAL_LIMIT,
+        "admin_email": ADMIN_EMAIL,
+    }
+
 @app.get("/debug/store")
 def debug_store():
     upstash_url = os.environ.get("UPSTASH_URL", "")
