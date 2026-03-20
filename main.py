@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 1.9.8
+Backend API · Version 2.1
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.0.0")
+app = FastAPI(title="PPS API", version="2.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,8 +76,11 @@ async def analyze(
     except Exception:
         raise HTTPException(422, "PDF konnte nicht geöffnet werden.")
 
+    import gc
     result = run_analysis(doc, data, print_width_mm, print_height_mm, scale, job_name, file.filename)
     doc.close()
+    del data
+    gc.collect()
     return result
 
 
@@ -96,7 +99,11 @@ async def fix_pdf(
     fix_resolution: bool = Form(False),
     job_name: Optional[str] = Form(""),
 ):
+    import gc
     data = await file.read()
+    if len(data) > 100 * 1024 * 1024:
+        raise HTTPException(413, "Datei zu groß (max. 100 MB).")
+
     try:
         doc = fitz.open(stream=data, filetype="pdf")
     except Exception:
@@ -104,31 +111,52 @@ async def fix_pdf(
 
     upscaled_count = 0
 
-    # Analyse für Report (auf Original)
+    # Schritt 1: Analyse NUR für Report — danach Speicher freigeben
+    analysis_result = None
     try:
         analysis_result = run_analysis(doc, data, print_width_mm, print_height_mm,
                                        scale, "", file.filename)
     except Exception:
-        analysis_result = None
+        pass
 
-    # Schritt 1: Upscaling ZUERST auf Original-PDF (bevor Bleed-Fix die Struktur ändert)
+    # Schritt 2: Preview-Bild JETZT generieren (solange doc noch offen) — klein halten
+    preview_bytes = None
+    try:
+        prev_page = doc[0]
+        prev_pix = prev_page.get_pixmap(matrix=fitz.Matrix(0.3, 0.3), alpha=False)
+        import io as _prev_io
+        from PIL import Image as _PrevImg
+        prev_buf = _prev_io.BytesIO()
+        _PrevImg.frombytes("RGB", (prev_pix.width, prev_pix.height),
+                           prev_pix.samples).save(prev_buf, format="JPEG", quality=70)
+        preview_bytes = prev_buf.getvalue()
+        del prev_pix, prev_buf  # sofort freigeben
+        gc.collect()
+    except Exception:
+        preview_bytes = None
+
+    # Schritt 3: Upscaling auf Original-PDF
     if fix_resolution:
         upscaled_bytes, upscaled_count = upscale_images_in_pdf(doc, scale)
         if upscaled_bytes:
             doc.close()
             doc = fitz.open(stream=upscaled_bytes, filetype="pdf")
+            del upscaled_bytes
+            gc.collect()
 
-    # Schritt 2: Bleed + Cropmarks fixen
+    # Schritt 4: Bleed + Cropmarks fixen — data danach freigeben
     fixed_pdf, fixes_applied = apply_fixes(
         doc, data, print_width_mm, print_height_mm, scale,
         fix_cropmarks, fix_bleed, fix_colorspace
     )
     doc.close()
+    del data  # Original-Bytes nicht mehr nötig
+    gc.collect()
 
     if upscaled_count > 0:
         fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
 
-    # Warnung für nicht-fixbare Bilder (unter 25 DPI)
+    # Warnung für nicht-fixbare Bilder
     if analysis_result:
         for check in analysis_result.get("checks", []):
             if check.get("id") == "resolution":
@@ -136,8 +164,8 @@ async def fix_pdf(
                 bad = [i for i in imgs if i.get("dpi_at_1to1", 0) < 25]
                 if bad:
                     fixes_applied.append(
-                        f"⚠ {len(bad)} Bild(er) unter 25 DPI — "
-                        f"zu niedrig für Upscaling, Originaldatei erforderlich"
+                        f"{len(bad)} Bild(er) unter 25 DPI — "
+                        f"zu niedrig fuer Upscaling, Originaldatei erforderlich"
                     )
 
     import zipfile
@@ -147,24 +175,9 @@ async def fix_pdf(
     base_name = file.filename.replace(".pdf", "")
     fixed_name = base_name + "_PPS_fixed.pdf"
 
-    # Report generieren
+    # Schritt 5: Report generieren — preview_bytes bereits fertig
+    report_bytes = None
     try:
-        # Preview-Bild der Originalseite generieren
-        try:
-            prev_doc = fitz.open(stream=data, filetype="pdf")
-            prev_page = prev_doc[0]
-            prev_mat = fitz.Matrix(0.5, 0.5)
-            prev_pix = prev_page.get_pixmap(matrix=prev_mat, alpha=False)
-            import io as _prev_io
-            prev_buf = _prev_io.BytesIO()
-            from PIL import Image as _PrevImg
-            _PrevImg.frombytes("RGB", (prev_pix.width, prev_pix.height),
-                               prev_pix.samples).save(prev_buf, format="JPEG", quality=80)
-            preview_bytes = prev_buf.getvalue()
-            prev_doc.close()
-        except Exception:
-            preview_bytes = None
-
         report_bytes = _generate_report_bytes(
             result_data=analysis_result,
             filename=file.filename,
@@ -176,6 +189,8 @@ async def fix_pdf(
             scale_val=scale,
             preview_bytes=preview_bytes
         )
+        del preview_bytes
+        gc.collect()
     except Exception as _rep_err:
         import sys, traceback
         print(f"[PPS] report error: {_rep_err}", file=sys.stderr)
@@ -988,41 +1003,42 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 
         from PIL import Image
         import io as _io
+        import gc as _gc
 
-        # Randstreifen als Pixmaps rendern
-        dpi = 150
+        # Randstreifen als Pixmaps rendern — 100 DPI statt 150 spart ~55% RAM
+        dpi = 100
         sf = dpi / 72.0
 
         def render_strip(x0, y0, x1, y1):
             mat = fitz.Matrix(sf, sf)
-            return page.get_pixmap(matrix=mat, alpha=False,
-                                   clip=fitz.Rect(x0, y0, x1, y1))
-
-        def pix_to_img(pix):
-            return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            pix = page.get_pixmap(matrix=mat, alpha=False,
+                                  clip=fitz.Rect(x0, y0, x1, y1))
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            pix = None  # Pixmap sofort freigeben
+            return img
 
         def img_to_bytes(img):
             buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=92)
+            img.save(buf, format="JPEG", quality=88)
             return buf.getvalue()
 
-        # Streifen rendern (aus Originalkoordinaten)
-        strip_l = pix_to_img(render_strip(cx0, cy0, cx0 + B, cy1)).transpose(Image.FLIP_LEFT_RIGHT)
-        strip_r = pix_to_img(render_strip(cx1 - B, cy0, cx1, cy1)).transpose(Image.FLIP_LEFT_RIGHT)
-        strip_t = pix_to_img(render_strip(cx0, cy0, cx1, cy0 + B)).transpose(Image.FLIP_TOP_BOTTOM)
-        strip_b = pix_to_img(render_strip(cx0, cy1 - B, cx1, cy1)).transpose(Image.FLIP_TOP_BOTTOM)
-        corner_tl = pix_to_img(render_strip(cx0, cy0, cx0+B, cy0+B)).transpose(Image.ROTATE_180)
-        corner_tr = pix_to_img(render_strip(cx1-B, cy0, cx1, cy0+B)).transpose(Image.ROTATE_180)
-        corner_bl = pix_to_img(render_strip(cx0, cy1-B, cx0+B, cy1)).transpose(Image.ROTATE_180)
-        corner_br = pix_to_img(render_strip(cx1-B, cy1-B, cx1, cy1)).transpose(Image.ROTATE_180)
+        # Streifen rendern und sofort transformieren
+        strip_l = render_strip(cx0, cy0, cx0 + B, cy1).transpose(Image.FLIP_LEFT_RIGHT)
+        strip_r = render_strip(cx1 - B, cy0, cx1, cy1).transpose(Image.FLIP_LEFT_RIGHT)
+        strip_t = render_strip(cx0, cy0, cx1, cy0 + B).transpose(Image.FLIP_TOP_BOTTOM)
+        strip_b = render_strip(cx0, cy1 - B, cx1, cy1).transpose(Image.FLIP_TOP_BOTTOM)
+        corner_tl = render_strip(cx0, cy0, cx0+B, cy0+B).transpose(Image.ROTATE_180)
+        corner_tr = render_strip(cx1-B, cy0, cx1, cy0+B).transpose(Image.ROTATE_180)
+        corner_bl = render_strip(cx0, cy1-B, cx0+B, cy1).transpose(Image.ROTATE_180)
+        corner_br = render_strip(cx1-B, cy1-B, cx1, cy1).transpose(Image.ROTATE_180)
 
-        # Vollbild der Originalseite rendern für die Mitte
-        # (inkl. Randstreifen als Basis)
-        full_sf = sf
-        full_mat = fitz.Matrix(full_sf, full_sf)
+        # Vollbild der Originalseite
+        full_mat = fitz.Matrix(sf, sf)
         full_pix = page.get_pixmap(matrix=full_mat, alpha=False,
                                     clip=fitz.Rect(cx0, cy0, cx1, cy1))
-        full_img = pix_to_img(full_pix)
+        full_img = Image.frombytes("RGB", (full_pix.width, full_pix.height), full_pix.samples)
+        full_pix = None
+        _gc.collect()
 
         # Gesamtbild aufbauen
         bx = int(B * sf)
@@ -1033,33 +1049,37 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 
         canvas = Image.new("RGB", (nw_px, nh_px), (255, 255, 255))
 
-        # Streifen einfügen
-        canvas.paste(corner_tl.resize((bx, bx), Image.LANCZOS), (0, 0))
-        canvas.paste(strip_t.resize((pw, bx), Image.LANCZOS), (bx, 0))
-        canvas.paste(corner_tr.resize((bx, bx), Image.LANCZOS), (bx+pw, 0))
-        canvas.paste(strip_l.resize((bx, ph), Image.LANCZOS), (0, bx))
-        canvas.paste(full_img, (bx, bx))
-        canvas.paste(strip_r.resize((bx, ph), Image.LANCZOS), (bx+pw, bx))
-        canvas.paste(corner_bl.resize((bx, bx), Image.LANCZOS), (0, bx+ph))
-        canvas.paste(strip_b.resize((pw, bx), Image.LANCZOS), (bx, bx+ph))
-        canvas.paste(corner_br.resize((bx, bx), Image.LANCZOS), (bx+pw, bx+ph))
+        # Streifen einfügen und sofort freigeben
+        canvas.paste(corner_tl.resize((bx, bx), Image.LANCZOS), (0, 0)); corner_tl = None
+        canvas.paste(strip_t.resize((pw, bx), Image.LANCZOS), (bx, 0)); strip_t = None
+        canvas.paste(corner_tr.resize((bx, bx), Image.LANCZOS), (bx+pw, 0)); corner_tr = None
+        canvas.paste(strip_l.resize((bx, ph), Image.LANCZOS), (0, bx)); strip_l = None
+        canvas.paste(full_img, (bx, bx)); full_img = None
+        canvas.paste(strip_r.resize((bx, ph), Image.LANCZOS), (bx+pw, bx)); strip_r = None
+        canvas.paste(corner_bl.resize((bx, bx), Image.LANCZOS), (0, bx+ph)); corner_bl = None
+        canvas.paste(strip_b.resize((pw, bx), Image.LANCZOS), (bx, bx+ph)); strip_b = None
+        canvas.paste(corner_br.resize((bx, bx), Image.LANCZOS), (bx+pw, bx+ph)); corner_br = None
+        _gc.collect()
 
-        # Canvas-Ansatz: sauber, keine Passmarken-Artefakte
-        # Render-Auflösung: 150 DPI — gut für Großformatdruck
         new_doc = fitz.open()
         new_w = W + 2 * B
         new_h = H + 2 * B
         new_page = new_doc.new_page(width=new_w, height=new_h)
 
         canvas_buf = _io.BytesIO()
-        canvas.save(canvas_buf, format="JPEG", quality=95)
+        canvas.save(canvas_buf, format="JPEG", quality=92)
+        canvas = None  # Canvas freigeben
+        _gc.collect()
+
         new_page.insert_image(
             fitz.Rect(0, 0, new_w, new_h),
             stream=canvas_buf.getvalue()
         )
+        canvas_buf = None
 
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
+        _gc.collect()
 
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
         return pdf_bytes, fixes_applied
