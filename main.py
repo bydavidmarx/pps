@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.4
+Backend API · Version 2.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.1.2")
+app = FastAPI(title="PPS API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,6 +60,7 @@ async def analyze(
     job_name: Optional[str] = Form(""),
     user_email: Optional[str] = Form(""),
 ):
+    import asyncio, gc
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Nur PDF-Dateien erlaubt.")
 
@@ -76,11 +77,26 @@ async def analyze(
     except Exception:
         raise HTTPException(422, "PDF konnte nicht geöffnet werden.")
 
-    import gc
-    result = run_analysis(doc, data, print_width_mm, print_height_mm, scale, job_name, file.filename)
-    doc.close()
-    del data
-    gc.collect()
+    try:
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: run_analysis(
+                doc, data, print_width_mm, print_height_mm, scale, job_name, file.filename)),
+            timeout=120.0
+        )
+    except asyncio.TimeoutError:
+        doc.close()
+        _notify_error(f"Analyse-Timeout: {file.filename} ({len(data)//1024//1024}MB)")
+        raise HTTPException(504, "Analyse-Timeout (>120s). Bitte kleinere Datei versuchen.")
+    except Exception as e:
+        doc.close()
+        _notify_error(f"Analyse-Fehler: {file.filename} — {e}")
+        raise HTTPException(500, f"Analyse fehlgeschlagen: {str(e)[:200]}")
+    finally:
+        try: doc.close()
+        except: pass
+        del data
+        gc.collect()
     return result
 
 
@@ -99,7 +115,7 @@ async def fix_pdf(
     fix_resolution: bool = Form(False),
     job_name: Optional[str] = Form(""),
 ):
-    import gc
+    import gc, asyncio
     data = await file.read()
     if len(data) > 100 * 1024 * 1024:
         raise HTTPException(413, "Datei zu groß (max. 100 MB).")
@@ -135,20 +151,44 @@ async def fix_pdf(
     except Exception:
         preview_bytes = None
 
-    # Schritt 3: Upscaling auf Original-PDF
-    if fix_resolution:
-        upscaled_bytes, upscaled_count = upscale_images_in_pdf(doc, scale)
-        if upscaled_bytes:
-            doc.close()
-            doc = fitz.open(stream=upscaled_bytes, filetype="pdf")
-            del upscaled_bytes
-            gc.collect()
+    # Schritt 3: Upscaling auf Original-PDF (mit Timeout)
+    try:
+        if fix_resolution:
+            loop = asyncio.get_event_loop()
+            upscale_result = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: upscale_images_in_pdf(doc, scale)),
+                timeout=180.0
+            )
+            upscaled_bytes, upscaled_count = upscale_result
+            if upscaled_bytes:
+                doc.close()
+                doc = fitz.open(stream=upscaled_bytes, filetype="pdf")
+                del upscaled_bytes
+                gc.collect()
+    except asyncio.TimeoutError:
+        _notify_error(f"Upscaling-Timeout: {file.filename}")
+        # Weiter ohne Upscaling — besser als gar nichts
 
-    # Schritt 4: Bleed + Cropmarks fixen — data danach freigeben
-    fixed_pdf, fixes_applied = apply_fixes(
-        doc, data, print_width_mm, print_height_mm, scale,
-        fix_cropmarks, fix_bleed, fix_colorspace
-    )
+    # Schritt 4: Bleed + Cropmarks fixen (mit Timeout)
+    try:
+        loop = asyncio.get_event_loop()
+        fix_result = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: apply_fixes(
+                doc, data, print_width_mm, print_height_mm, scale,
+                fix_cropmarks, fix_bleed, fix_colorspace)),
+            timeout=180.0
+        )
+        fixed_pdf, fixes_applied = fix_result
+    except asyncio.TimeoutError:
+        doc.close()
+        del data
+        _notify_error(f"Fix-Timeout: {file.filename}")
+        raise HTTPException(504, "Fix-Timeout (>180s). Datei ist moeglicherweise zu komplex.")
+    except Exception as e:
+        doc.close()
+        del data
+        _notify_error(f"Fix-Fehler: {file.filename} — {e}")
+        raise HTTPException(500, f"Fix fehlgeschlagen: {str(e)[:200]}")
     doc.close()
     del data  # Original-Bytes nicht mehr nötig
     gc.collect()
@@ -1314,6 +1354,22 @@ def _send_email(to: str, subject: str, html: str, text: str = ""):
 def _gen_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits
     return "".join(random.choices(chars, k=length))
+
+def _notify_error(message: str):
+    """Sendet eine Fehler-Benachrichtigung an den Admin."""
+    try:
+        from datetime import datetime
+        now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        html = f"""
+        <div style="font-family:monospace;padding:1.5rem;color:#1a1a18;background:#fdf0ee;border-left:4px solid #c0392b">
+          <strong style="color:#c0392b">&#9888; PPS Fehler-Alarm</strong><br><br>
+          <b>Zeitpunkt:</b> {now}<br>
+          <b>Meldung:</b> {message}<br><br>
+          <small style="color:#9a9a94">PPS Backend &mdash; Automatische Benachrichtigung</small>
+        </div>"""
+        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)
+    except Exception:
+        pass  # Notification darf nie einen weiteren Fehler verursachen
 
 def _is_business_email(email: str) -> bool:
     free = {"gmail.com","googlemail.com","yahoo.com","yahoo.de","hotmail.com",
