@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.2.2")
+app = FastAPI(title="PPS API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1899,6 +1899,132 @@ async def generate_report(
 
 
 
+
+
+# ─────────────────────────────────────────────
+#  ADMIN DASHBOARD ENDPOINTS
+# ─────────────────────────────────────────────
+
+class NotificationMsg(BaseModel):
+    title: str
+    message: str
+    type: str = "info"   # info | warn | err
+
+@app.post("/admin/notification")
+def push_notification(req: NotificationMsg, admin_email: str, admin_password: str):
+    """Pushes a notification to all users via Upstash."""
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    from datetime import datetime as _dt2
+    notif = {
+        "id": int(_dt2.now().timestamp() * 1000),
+        "title": req.title,
+        "sub": req.message,
+        "type": req.type,
+        "time": _dt2.now().strftime("%H:%M"),
+        "created": _dt2.now().strftime("%d.%m.%Y %H:%M"),
+        "read": False,
+    }
+    existing_raw = _upstash_get("pps_global_notifications") or "[]"
+    try:
+        notifs = json.loads(existing_raw)
+    except Exception:
+        notifs = []
+    notifs.insert(0, notif)
+    notifs = notifs[:50]  # max 50
+    _upstash_set("pps_global_notifications", json.dumps(notifs))
+    return {"success": True, "notification": notif}
+
+@app.get("/admin/notifications")
+def get_notifications(admin_email: str, admin_password: str):
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    raw = _upstash_get("pps_global_notifications") or "[]"
+    try:
+        return {"notifications": json.loads(raw)}
+    except Exception:
+        return {"notifications": []}
+
+@app.delete("/admin/notifications")
+def clear_notifications(admin_email: str, admin_password: str):
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    _upstash_set("pps_global_notifications", "[]")
+    return {"success": True}
+
+@app.get("/system/notifications")
+def get_global_notifications():
+    """Public endpoint — returns global notifications for all users."""
+    raw = _upstash_get("pps_global_notifications") or "[]"
+    try:
+        return {"notifications": json.loads(raw)}
+    except Exception:
+        return {"notifications": []}
+
+@app.post("/admin/smtp-test")
+def smtp_test(admin_email: str, admin_password: str):
+    """Sends a test email to the admin address."""
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    from datetime import datetime as _dt3
+    html = f"""<div style="font-family:monospace;padding:1.5rem;color:#1a1a18">
+      <strong style="color:#2d5a3d">&#10003; PPS SMTP Test erfolgreich</strong><br><br>
+      Zeitpunkt: {_dt3.now().strftime("%d.%m.%Y %H:%M:%S")}<br>
+      Von: {SMTP_FROM}<br>
+      An: {NOTIFY_EMAIL}<br><br>
+      <small style="color:#9a9a94">PPS Admin &mdash; SMTP-Test</small>
+    </div>"""
+    ok = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
+    if ok:
+        return {"success": True, "message": f"Test-Mail an {NOTIFY_EMAIL} gesendet."}
+    else:
+        raise HTTPException(500, "SMTP-Versand fehlgeschlagen. Bitte Variablen pruefen.")
+
+@app.post("/admin/users/{email}/upgrade")
+def upgrade_user(email: str, admin_email: str, admin_password: str):
+    """Upgrades a trial user to full customer."""
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    users = load_users()
+    email = email.strip().lower()
+    if email not in users:
+        raise HTTPException(404, "Benutzer nicht gefunden.")
+    users[email]["role"] = "customer"
+    users[email].pop("trial_analyses", None)
+    users[email].pop("trial_limit", None)
+    save_users(users)
+    return {"success": True, "message": f"{email} auf Vollzugang upgraded."}
+
+@app.get("/admin/stats")
+def get_stats(admin_email: str, admin_password: str):
+    """Returns trial and user statistics."""
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    users = load_users()
+    trials = {e: u for e, u in users.items() if u.get("role") == "trial"}
+    customers = {e: u for e, u in users.items() if u.get("role") != "trial"}
+    total_analyses = sum(int(u.get("trial_analyses", 0)) for u in trials.values())
+    return {
+        "total_users": len(users),
+        "trial_users": len(trials),
+        "customer_users": len(customers),
+        "total_trial_analyses": total_analyses,
+        "trials": [
+            {
+                "email": e,
+                "name": u.get("name",""),
+                "company": u.get("company",""),
+                "analyses_used": int(u.get("trial_analyses", 0)),
+                "trial_limit": int(u.get("trial_limit", 10)),
+                "created": u.get("created",""),
+            }
+            for e, u in trials.items()
+        ],
+        "customers": [
+            {"email": e, "name": u.get("name",""), "company": u.get("company","")}
+            for e, u in customers.items()
+        ]
+    }
 
 # ─────────────────────────────────────────────
 #  SYSTEM BANNER ENDPOINT
