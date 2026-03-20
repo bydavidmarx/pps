@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.1
+Backend API · Version 2.2
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -14,7 +14,7 @@ import zlib
 import math
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.1.0")
+app = FastAPI(title="PPS API", version="2.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -384,19 +384,39 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
         "details": font_info
     })
 
-    # 8. Color space
-    cs_status = "ok" if color_info["is_cmyk"] else ("warn" if color_info["is_mixed"] else "error")
+    # 8. Color space — neutral anzeigen, Empfehlung aussprechen, nicht als Fehler werten
+    spot_colors = color_info.get("spot_colors", [])
+    cutcontur   = color_info.get("cutcontur", [])
+
+    # Farbraum-Wert aufbauen
+    cs_value = color_info["colorspace_summary"]
+    if spot_colors:
+        spot_label = ", ".join(spot_colors[:5]) + (" ..." if len(spot_colors) > 5 else "")
+        cs_value += f" · Spotfarbe(n): {spot_label}"
+
+    # Hinweistext
+    if color_info["is_cmyk"]:
+        cs_note = "CMYK-Farbraum erkannt \u2014 optimal f\u00fcr Textildruck."
+    elif color_info["is_rgb"]:
+        cs_note = "RGB-Farbraum erkannt. Empfehlung: CMYK mit ISO Coated v2 f\u00fcr optimale Druckergebnisse."
+    elif color_info["is_mixed"]:
+        cs_note = "Gemischte Farbr\u00e4ume (CMYK + RGB). Empfehlung: alle Objekte in CMYK konvertieren."
+    else:
+        cs_note = "Farbraum nicht eindeutig erkennbar (evtl. reine Vektordatei)."
+
+    if cutcontur:
+        cc_label = ", ".join(cutcontur)
+        cs_note += f" \u2713 CutContur erkannt: {cc_label}"
+    elif spot_colors and not cutcontur:
+        cs_note += f" Spotfarbe(n) vorhanden \u2014 keine CutContur erkannt."
+
     checks.append({
         "id": "colorspace",
         "label": "Farbraum",
-        "status": cs_status,
-        "value": color_info["colorspace_summary"],
-        "note": {
-            "ok": "CMYK-Farbraum erkannt — korrekt für Textildruck.",
-            "warn": "Gemischte Farbräume (CMYK + RGB). Bitte alles in CMYK konvertieren.",
-            "error": "RGB-Farbraum erkannt. Für Textildruck ist CMYK mit ISO Coated v2 erforderlich."
-        }[cs_status],
-        "fixable": not color_info["is_cmyk"],
+        "status": "ok",   # immer neutral — nur informieren
+        "value": cs_value,
+        "note": cs_note,
+        "fixable": False,
         "details": color_info
     })
 
@@ -657,6 +677,50 @@ def analyze_colorspace(page, doc, raw_bytes):
         cs_parts.append("Nicht erkennbar (evtl. reine Vektordatei)")
         is_cmyk = True  # Vector-only = safe assumption for display
 
+    # ── Spotcolor / CutContur Erkennung ──
+    spot_names = []
+    try:
+        # PyMuPDF: alle Colorspace-Objekte durchsuchen
+        for xref in range(1, doc.xref_length()):
+            try:
+                if doc.xref_is_stream(xref):
+                    continue
+                obj_str = doc.xref_object(xref, compressed=False)
+                if "/Separation" in obj_str or "/DeviceN" in obj_str:
+                    # Spotfarbe gefunden — Namen extrahieren
+                    import re
+                    # /Separation (Name) ...
+                    sep_match = re.search(r'/Separation\s*\(([^)]+)\)', obj_str)
+                    if sep_match:
+                        name = sep_match.group(1).strip()
+                        if name not in spot_names:
+                            spot_names.append(name)
+                    # /Separation /Name ...
+                    sep_match2 = re.search(r'/Separation\s*/([A-Za-z0-9_.-]+)', obj_str)
+                    if sep_match2:
+                        name = sep_match2.group(1).strip()
+                        if name not in spot_names:
+                            spot_names.append(name)
+                    # /DeviceN [(Name1)(Name2)...]
+                    dn_match = re.search(r'/DeviceN\s*\[([^\]]+)\]', obj_str)
+                    if dn_match:
+                        for n in re.findall(r'\(([^)]+)\)|/([A-Za-z0-9_.-]+)', dn_match.group(1)):
+                            name = (n[0] or n[1]).strip()
+                            if name and name not in spot_names:
+                                spot_names.append(name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Erkennen ob eine Spotfarbe eine CutContur ist
+    cutcontur_names = []
+    for name in spot_names:
+        nl = name.lower().replace(" ", "").replace("-", "").replace("_", "")
+        if any(kw in nl for kw in ["cut", "kontur", "contour", "kontur", "die", "thru",
+                                    "cutter", "cutline", "dieline", "stanze", "crease"]):
+            cutcontur_names.append(name)
+
     return {
         "is_cmyk": is_cmyk,
         "is_rgb": is_rgb,
@@ -664,6 +728,8 @@ def analyze_colorspace(page, doc, raw_bytes):
         "icc_name": icc_name,
         "icc_ok": icc_ok,
         "colorspace_summary": " · ".join(cs_parts),
+        "spot_colors": spot_names,
+        "cutcontur": cutcontur_names,
     }
 
 
@@ -1531,7 +1597,7 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
         icon = si.get(s, "·")
         label = c.get("label", "").upper()
         value = c.get("value", "–")
-        note = c.get("note", "")
+        note = c.get("note") or ""
 
         # Details (Bilder)
         det_content = ""
@@ -1544,7 +1610,7 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
             det_rows.append([
                 Paragraph(f'<font color="{dcol}"><b>{dpi:.1f} DPI</b></font>',
                           ps('di', fontSize=8)),
-                Paragraph(f'{img.get("width",0)}×{img.get("height",0)}px · '
+                Paragraph(f'{img.get("width_px",img.get("width",0))}×{img.get("height_px",img.get("height",0))}px · '
                           f'{img.get("colorspace","?")} · {dpi:.1f} DPI@1:1',
                           ps('dn', fontSize=8, textColor=colors.HexColor('#9a9a94'))),
             ])
