@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.1.3
+Backend API · Version 2.3.2
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -12,9 +12,14 @@ import io
 import struct
 import zlib
 import math
+import sys
+import gc
+import json
+import os
+import re
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.3.1")
+app = FastAPI(title="PPS API", version="2.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -730,7 +735,6 @@ def analyze_colorspace(page, doc, raw_bytes):
                 obj_str = doc.xref_object(xref, compressed=False)
                 if "/Separation" in obj_str or "/DeviceN" in obj_str:
                     # Spotfarbe gefunden — Namen extrahieren
-                    import re
                     # /Separation (Name) ...
                     sep_match = re.search(r'/Separation\s*\(([^)]+)\)', obj_str)
                     if sep_match:
@@ -838,7 +842,6 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     """
     from PIL import Image
     import io as _io
-    import sys
 
     page = doc[0]
     image_list = page.get_images(full=True)
@@ -894,7 +897,6 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
 
     import pikepdf
     import io as _io2
-    import sys
 
     upscaled_count = 0
     pdf_bytes_orig = doc.tobytes()
@@ -985,7 +987,6 @@ def _estimate_trim_area(page, mediabox):
     Beschnittzeichen sind kurze dünne Linien an den 4 Ecken.
     Die inneren Enden der Linien definieren die TrimBox-Ecken.
     """
-    import sys
     paths = page.get_drawings()
     mw = mediabox.width
     mh = mediabox.height
@@ -1201,9 +1202,6 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
 #  USER STORE — Upstash Redis REST API
 #  Kostenlos, persistent, keine Verifizierung nötig
 # ─────────────────────────────────────────────
-import json
-import os
-import sys
 import urllib.request
 import urllib.error
 import urllib.parse
