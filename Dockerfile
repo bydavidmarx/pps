@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.9-slim
 # cache-bust: 2026-03-22
 
 WORKDIR /app
