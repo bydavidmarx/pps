@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+ARG CACHEBUST=2026-03-22-18:00
 COPY . .
 
 EXPOSE 8000
