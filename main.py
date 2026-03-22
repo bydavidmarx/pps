@@ -19,7 +19,7 @@ import os
 import re
 from typing import Optional
 
-app = FastAPI(title="PPS API", version="2.3.2")
+app = FastAPI(title="PPS API", version="2.3.2", docs_url=None)
 
 app.add_middleware(
     CORSMiddleware,
