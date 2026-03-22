@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.2
+Backend API · Version 2.3.2.
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -2162,4 +2162,5 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    
 
