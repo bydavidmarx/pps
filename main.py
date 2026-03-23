@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.3
+Backend API · Version 2.3.4
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -662,82 +662,6 @@ def analyze_fonts(doc):
 
 
 # ─────────────────────────────────────────────
-#  ICC PROFILE DESCRIPTION PARSER
-# ─────────────────────────────────────────────
-def _read_icc_description(icc_bytes: bytes) -> str:
-    """
-    Liest den 'desc'-Tag direkt aus den ICC-Profil-Bytes.
-    Unterstützt beide ICC-Formate: altes 'desc' (ASCII) und neues 'mluc' (Unicode).
-    """
-    try:
-        if len(icc_bytes) < 132:
-            return ""
-        tag_count = struct.unpack_from('>I', icc_bytes, 128)[0]
-        if tag_count > 100:  # Plausibilitätsprüfung
-            return ""
-        for i in range(tag_count):
-            base = 132 + i * 12
-            if base + 12 > len(icc_bytes):
-                break
-            tag_sig    = icc_bytes[base:base+4]
-            tag_offset = struct.unpack_from('>I', icc_bytes, base+4)[0]
-            tag_size   = struct.unpack_from('>I', icc_bytes, base+8)[0]
-            if tag_sig == b'desc':
-                if tag_offset + tag_size > len(icc_bytes) or tag_size < 4:
-                    break
-                data     = icc_bytes[tag_offset:tag_offset+tag_size]
-                type_sig = data[:4]
-                if type_sig == b'desc' and len(data) >= 12:
-                    # Altes Format: Pascal-String (ASCII) ab Byte 12
-                    length = struct.unpack_from('>I', data, 8)[0]
-                    raw = data[12:12+length].rstrip(b'\x00')
-                    return raw.decode('ascii', errors='replace').strip()
-                elif type_sig == b'mluc' and len(data) >= 24:
-                    # Neues Format: Unicode (UTF-16-BE)
-                    rec_count  = struct.unpack_from('>I', data, 8)[0]
-                    if rec_count < 1:
-                        break
-                    str_len    = struct.unpack_from('>I', data, 16)[0]
-                    str_offset = struct.unpack_from('>I', data, 20)[0]
-                    if str_offset + str_len <= len(data):
-                        raw = data[str_offset:str_offset+str_len]
-                        return raw.decode('utf-16-be', errors='replace').rstrip('\x00').strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _normalize_icc_name(raw_name: str) -> tuple:
-    """
-    Gibt (display_name, icc_ok) zurück.
-    Prüft auf bekannte Druckprofile (ISO Coated v2, Fogra39 etc.).
-    """
-    nl = raw_name.lower()
-    if "iso coated v2" in nl or "isocoated_v2" in nl:
-        return ("ISO Coated v2 (ECI)", True)
-    if "fogra39" in nl:
-        return ("ISO Coated v2 / Fogra39", True)
-    if "fogra51" in nl:
-        return ("ISO Uncoated v2 / Fogra51", False)
-    if "fogra" in nl:
-        return (raw_name, False)
-    if "srgb" in nl or "s rgb" in nl or "iec61966" in nl:
-        return ("sRGB IEC61966", False)
-    if "adobe rgb" in nl:
-        return ("Adobe RGB (1998)", False)
-    if "display p3" in nl:
-        return ("Display P3", False)
-    if "p3" in nl and "display" in nl:
-        return ("Display P3", False)
-    if "prophoto" in nl:
-        return ("ProPhoto RGB", False)
-    if "rec. 2020" in nl or "rec2020" in nl:
-        return ("Rec. 2020", False)
-    # Unbekanntes Profil — Originalname zurückgeben
-    return (raw_name, False)
-
-
-# ─────────────────────────────────────────────
 #  COLOR SPACE & ICC ANALYSIS
 # ─────────────────────────────────────────────
 def analyze_colorspace(page, doc, raw_bytes):
@@ -767,58 +691,27 @@ def analyze_colorspace(page, doc, raw_bytes):
         is_mixed = True
         is_cmyk = False
 
-    # ── ICC-Profil: aus PDF-Streams lesen (korrekte Methode) ──
-    # Iteriere durch alle Objekte und suche ICC-Profil-Streams
-    # (erkennbar am /N-Eintrag = Anzahl Farbkanäle im ICC-Stream-Dict)
-    try:
-        for xref in range(1, doc.xref_length()):
-            try:
-                if not doc.xref_is_stream(xref):
-                    continue
-                obj_str = doc.xref_object(xref, compressed=False)
-                # ICC-Streams haben /N (Kanalanzahl) und kein /Subtype
-                if '/N ' not in obj_str and '/N\n' not in obj_str:
-                    continue
-                # Kein PDF-Bild oder anderer Stream-Typ
-                if any(k in obj_str for k in ['/Subtype', '/Width', '/Height', '/BitsPerComponent']):
-                    continue
-                icc_bytes = doc.xref_stream(xref)
-                if not icc_bytes or len(icc_bytes) < 132:
-                    continue
-                # Validierung: ICC-Profile beginnen immer mit 4-Byte-Größe, dann Profil-Signatur
-                # Byte 36-39 müssen "acsp" sein
-                if len(icc_bytes) >= 40 and icc_bytes[36:40] == b'acsp':
-                    desc = _read_icc_description(icc_bytes)
-                    if desc:
-                        icc_name, icc_ok = _normalize_icc_name(desc)
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
+    # ICC profile extraction from raw PDF bytes
+    icc_markers = [b"/ICCBased", b"ICCProfile", b"icc", b"ICC"]
+    raw_lower = raw_bytes.lower()
 
-    # ── Fallback: robuster Substring-Scan auf längere, eindeutige Strings ──
-    if not icc_name:
-        raw_lower = raw_bytes.lower()
-        # Nur längere, eindeutige Strings — KEIN kurzes "p3" oder "srgb"
-        fallback_profiles = [
-            (b"iso coated v2",   "ISO Coated v2 (ECI)",          True),
-            (b"isocoated_v2",    "ISO Coated v2 (ECI)",          True),
-            (b"fogra39",         "ISO Coated v2 / Fogra39",      True),
-            (b"fogra51",         "ISO Uncoated v2 / Fogra51",    False),
-            (b"adobe rgb (1998)","Adobe RGB (1998)",              False),
-            (b"adobe rgb",       "Adobe RGB (1998)",              False),
-            (b"display p3",      "Display P3",                   False),
-            (b"srgb iec61966",   "sRGB IEC61966",                False),
-        ]
-        for marker, name, ok in fallback_profiles:
-            if marker in raw_lower:
-                icc_name = name
-                icc_ok   = ok
-                break
+    known_profiles = {
+        b"iso coated v2": "ISO Coated v2 (ECI)",
+        b"isocoated_v2": "ISO Coated v2 (ECI)",
+        b"fogra39": "ISO Coated v2 / Fogra39",
+        b"fogra51": "ISO Uncoated v2 / Fogra51",
+        b"srgb": "sRGB IEC61966",
+        b"adobe rgb": "Adobe RGB (1998)",
+        b"p3": "Display P3",
+    }
+    for marker, name in known_profiles.items():
+        if marker in raw_lower:
+            icc_name = name
+            icc_ok = "iso coated v2" in name.lower() or "fogra39" in name.lower()
+            break
 
     if not icc_name:
-        raw_lower = raw_bytes.lower() if 'raw_lower' not in dir() else raw_lower
+        # Try to find any ICC keyword
         if b"/iccbased" in raw_lower or b"iccprofile" in raw_lower:
             icc_name = "ICC-Profil gefunden (Name nicht lesbar)"
             icc_ok = False
@@ -1437,6 +1330,7 @@ from datetime import datetime as _dt
 
 def _send_email(to: str, subject: str, html: str, text: str = ""):
     if not SMTP_USER or not SMTP_PASSWORD:
+        print("[PPS] SMTP: SMTP_USER oder SMTP_PASSWORD nicht gesetzt", file=sys.stderr)
         return False
     try:
         msg = MIMEMultipart("alternative")
@@ -1446,14 +1340,32 @@ def _send_email(to: str, subject: str, html: str, text: str = ""):
         if text:
             msg.attach(MIMEText(text, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASSWORD)
-            s.sendmail(SMTP_FROM, to, msg.as_string())
+
+        if SMTP_PORT == 465:
+            # SSL direkt (kein STARTTLS)
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo()
+                s.login(SMTP_USER, SMTP_PASSWORD)
+                s.sendmail(SMTP_FROM, to, msg.as_string())
+        else:
+            # STARTTLS (Port 587 oder 25)
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo()
+                s.starttls()
+                s.ehlo()  # Nach STARTTLS zwingend erneut ehlo() — SMTP-Protokoll
+                s.login(SMTP_USER, SMTP_PASSWORD)
+                s.sendmail(SMTP_FROM, to, msg.as_string())
+
+        print(f"[PPS] SMTP: Mail an {to} gesendet.", file=sys.stderr)
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"[PPS] SMTP Auth-Fehler: {e}", file=sys.stderr)
+        return False
+    except smtplib.SMTPException as e:
+        print(f"[PPS] SMTP-Fehler: {e}", file=sys.stderr)
+        return False
     except Exception as e:
-        print(f"[PPS] SMTP error: {e}")
+        print(f"[PPS] SMTP unbekannter Fehler: {type(e).__name__}: {e}", file=sys.stderr)
         return False
 
 def _gen_password(length: int = 10) -> str:
