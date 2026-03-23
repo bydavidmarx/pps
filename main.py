@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.4
+Backend API · Version 2.3.5
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -1328,10 +1328,10 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime as _dt
 
-def _send_email(to: str, subject: str, html: str, text: str = ""):
+def _send_email(to: str, subject: str, html: str, text: str = "") -> tuple:
+    """Returns (success: bool, error: str)"""
     if not SMTP_USER or not SMTP_PASSWORD:
-        print("[PPS] SMTP: SMTP_USER oder SMTP_PASSWORD nicht gesetzt", file=sys.stderr)
-        return False
+        return False, "SMTP_USER oder SMTP_PASSWORD nicht gesetzt"
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -1342,31 +1342,40 @@ def _send_email(to: str, subject: str, html: str, text: str = ""):
         msg.attach(MIMEText(html, "html", "utf-8"))
 
         if SMTP_PORT == 465:
-            # SSL direkt (kein STARTTLS)
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
                 s.ehlo()
                 s.login(SMTP_USER, SMTP_PASSWORD)
                 s.sendmail(SMTP_FROM, to, msg.as_string())
         else:
-            # STARTTLS (Port 587 oder 25)
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
                 s.ehlo()
                 s.starttls()
-                s.ehlo()  # Nach STARTTLS zwingend erneut ehlo() — SMTP-Protokoll
+                s.ehlo()
                 s.login(SMTP_USER, SMTP_PASSWORD)
                 s.sendmail(SMTP_FROM, to, msg.as_string())
 
-        print(f"[PPS] SMTP: Mail an {to} gesendet.", file=sys.stderr)
-        return True
+        print(f"[PPS] SMTP OK: Mail an {to} gesendet.", file=sys.stderr)
+        return True, ""
     except smtplib.SMTPAuthenticationError as e:
-        print(f"[PPS] SMTP Auth-Fehler: {e}", file=sys.stderr)
-        return False
+        msg = f"Auth-Fehler: Benutzername/Passwort falsch oder App-Passwort nötig. ({e})"
+        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
+        return False, msg
+    except smtplib.SMTPConnectError as e:
+        msg = f"Verbindung zu {SMTP_HOST}:{SMTP_PORT} fehlgeschlagen. ({e})"
+        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
+        return False, msg
     except smtplib.SMTPException as e:
-        print(f"[PPS] SMTP-Fehler: {e}", file=sys.stderr)
-        return False
+        msg = f"SMTP-Fehler: {type(e).__name__}: {e}"
+        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
+        return False, msg
+    except OSError as e:
+        msg = f"Netzwerk-Fehler (Timeout oder Host nicht erreichbar): {e}"
+        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
+        return False, msg
     except Exception as e:
-        print(f"[PPS] SMTP unbekannter Fehler: {type(e).__name__}: {e}", file=sys.stderr)
-        return False
+        msg = f"Unbekannter Fehler: {type(e).__name__}: {e}"
+        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
+        return False, msg
 
 def _gen_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits
@@ -1384,7 +1393,7 @@ def _notify_error(message: str):
           <b>Meldung:</b> {message}<br><br>
           <small style="color:#9a9a94">PPS Backend &mdash; Automatische Benachrichtigung</small>
         </div>"""
-        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)
+        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)  # Tuple wird ignoriert
     except Exception:
         pass  # Notification darf nie einen weiteren Fehler verursachen
 
@@ -1477,7 +1486,7 @@ def request_trial(req: TrialRequest):
       </div>
     </div>"""
 
-    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)
+    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)  # noqa
 
     # Notify studio
     notify_html = f"""
@@ -1489,7 +1498,7 @@ def request_trial(req: TrialRequest):
       Passwort: {password}<br>
       Zeitpunkt: {now_str}
     </div>"""
-    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)
+    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)  # noqa
 
     return {"success": True, "message": f"Test-Zugang fuer {email} angelegt. Bitte E-Mail pruefen."}
 
@@ -1991,11 +2000,11 @@ def smtp_test(admin_email: str, admin_password: str):
       An: {NOTIFY_EMAIL}<br><br>
       <small style="color:#9a9a94">PPS Admin &mdash; SMTP-Test</small>
     </div>"""
-    ok = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
+    ok, err = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
     if ok:
-        return {"success": True, "message": f"Test-Mail an {NOTIFY_EMAIL} gesendet."}
+        return {"success": True, "message": f"✓ Test-Mail an {NOTIFY_EMAIL} gesendet."}
     else:
-        raise HTTPException(500, "SMTP-Versand fehlgeschlagen. Bitte Variablen pruefen.")
+        raise HTTPException(500, f"SMTP-Fehler: {err}")
 
 @app.post("/admin/users/{email}/upgrade")
 def upgrade_user(email: str, admin_email: str, admin_password: str):
@@ -2131,7 +2140,7 @@ def report_issue(req: IssueReport):
             NOTIFY_EMAIL,
             f"PPS Fehlerbericht: {req.user} &mdash; {req.message[:60]}",
             html
-        )
+        )  # noqa — Ergebnis wird nicht benötigt
         return {"success": True}
     except Exception as e:
         print(f"[PPS] report-issue error: {e}", file=sys.stderr)
@@ -2176,7 +2185,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "2.3.2"}
+    return {"status": "ok", "service": "PPS API", "version": "2.1.2"}
 
 if __name__ == "__main__":
     import uvicorn
