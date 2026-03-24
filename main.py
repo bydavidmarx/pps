@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.7
+Backend API · Version 2.3.8
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -199,7 +199,7 @@ async def fix_pdf(
     gc.collect()
 
     if upscaled_count > 0:
-        fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI bei 1:1")
+        fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
 
     # Warnung für nicht-fixbare Bilder
     if analysis_result:
@@ -875,10 +875,10 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             if dpi_1to1 >= min_dpi_1to1:
                 continue  # bereits gut genug — kein Upscaling nötig
 
-            # Alle unter 50 DPI werden hochgerechnet
-            # Ziel: 100 DPI bei 1:1-Druckgröße (= 2× Minimum)
-            target_dpi_1to1 = 100.0
-            factor = min(target_dpi_1to1 / dpi_1to1, 4.0)  # max 4× upscale
+            # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
+            # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
+            target_dpi = 100.0
+            factor = min(target_dpi / dpi_1to1, 4.0)  # max 4x upscale
             to_upscale.append({
                 "xref": xref,
                 "rect": r,
@@ -1111,12 +1111,9 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         import io as _io
         import gc as _gc
 
-        # Renderauflösung: Ziel ist 50 DPI bei 1:1-Druckgröße
-        # Im Dokument (1:scale) brauchen wir also 50 × scale DPI
-        # Begrenzt auf 600 DPI als RAM-Schutz auf Railway
-        dpi = max(min(int(50 * scale), 600), 100)
+        # Randstreifen als Pixmaps rendern — 100 DPI statt 150 spart ~55% RAM
+        dpi = 100
         sf = dpi / 72.0
-        print(f"[PPS] bleed render: {dpi} DPI im Dokument = {dpi//scale} DPI@1:1 (scale={scale})", file=__import__('sys').stderr)
 
         def render_strip(x0, y0, x1, y1):
             mat = fitz.Matrix(sf, sf)
@@ -1186,11 +1183,20 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         )
         canvas_buf = None
 
+        # ── TrimBox setzen ──
+        # MediaBox = volle Seite inkl. Beschnitt (new_w × new_h)
+        # TrimBox  = Netto-Motiv ohne Beschnitt (B Punkte Einzug auf allen Seiten)
+        # Drucker und Cutter brauchen diese Information für die Schnittmarken
+        trim_rect = fitz.Rect(B, B, new_w - B, new_h - B)
+        new_page.set_trimbox(trim_rect)
+        print(f"[PPS] TrimBox gesetzt: {trim_rect} (Beschnitt: {B:.2f} pt = {B * PT_TO_MM:.1f} mm)", file=__import__('sys').stderr)
+
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
         _gc.collect()
 
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
+        fixes_applied.append(f"TrimBox gesetzt: Nettogröße {round(W * PT_TO_MM, 1)} × {round(H * PT_TO_MM, 1)} mm")
         return pdf_bytes, fixes_applied
 
     pdf_bytes = doc.tobytes(garbage=4, deflate=True)
@@ -2160,7 +2166,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "2.3.2"}
+    return {"status": "ok", "service": "PPS API", "version": "2.1.2"}
 
 if __name__ == "__main__":
     import uvicorn
