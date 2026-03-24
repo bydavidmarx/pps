@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.5
+Backend API · Version 2.3.7
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -199,7 +199,7 @@ async def fix_pdf(
     gc.collect()
 
     if upscaled_count > 0:
-        fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
+        fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI bei 1:1")
 
     # Warnung für nicht-fixbare Bilder
     if analysis_result:
@@ -875,10 +875,10 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             if dpi_1to1 >= min_dpi_1to1:
                 continue  # bereits gut genug — kein Upscaling nötig
 
-            # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
-            # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
-            target_dpi = 100.0
-            factor = min(target_dpi / dpi_1to1, 4.0)  # max 4x upscale
+            # Alle unter 50 DPI werden hochgerechnet
+            # Ziel: 100 DPI bei 1:1-Druckgröße (= 2× Minimum)
+            target_dpi_1to1 = 100.0
+            factor = min(target_dpi_1to1 / dpi_1to1, 4.0)  # max 4× upscale
             to_upscale.append({
                 "xref": xref,
                 "rect": r,
@@ -1111,9 +1111,12 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         import io as _io
         import gc as _gc
 
-        # Randstreifen als Pixmaps rendern — 100 DPI statt 150 spart ~55% RAM
-        dpi = 100
+        # Renderauflösung: Ziel ist 50 DPI bei 1:1-Druckgröße
+        # Im Dokument (1:scale) brauchen wir also 50 × scale DPI
+        # Begrenzt auf 600 DPI als RAM-Schutz auf Railway
+        dpi = max(min(int(50 * scale), 600), 100)
         sf = dpi / 72.0
+        print(f"[PPS] bleed render: {dpi} DPI im Dokument = {dpi//scale} DPI@1:1 (scale={scale})", file=__import__('sys').stderr)
 
         def render_strip(x0, y0, x1, y1):
             mat = fitz.Matrix(sf, sf)
@@ -1328,10 +1331,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime as _dt
 
-def _send_email(to: str, subject: str, html: str, text: str = "") -> tuple:
-    """Returns (success: bool, error: str)"""
+def _send_email(to: str, subject: str, html: str, text: str = ""):
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False, "SMTP_USER oder SMTP_PASSWORD nicht gesetzt"
+        return False
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -1340,42 +1342,15 @@ def _send_email(to: str, subject: str, html: str, text: str = "") -> tuple:
         if text:
             msg.attach(MIMEText(text, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
-
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo()
-                s.login(SMTP_USER, SMTP_PASSWORD)
-                s.sendmail(SMTP_FROM, to, msg.as_string())
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo()
-                s.starttls()
-                s.ehlo()
-                s.login(SMTP_USER, SMTP_PASSWORD)
-                s.sendmail(SMTP_FROM, to, msg.as_string())
-
-        print(f"[PPS] SMTP OK: Mail an {to} gesendet.", file=sys.stderr)
-        return True, ""
-    except smtplib.SMTPAuthenticationError as e:
-        msg = f"Auth-Fehler: Benutzername/Passwort falsch oder App-Passwort nötig. ({e})"
-        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
-        return False, msg
-    except smtplib.SMTPConnectError as e:
-        msg = f"Verbindung zu {SMTP_HOST}:{SMTP_PORT} fehlgeschlagen. ({e})"
-        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
-        return False, msg
-    except smtplib.SMTPException as e:
-        msg = f"SMTP-Fehler: {type(e).__name__}: {e}"
-        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
-        return False, msg
-    except OSError as e:
-        msg = f"Netzwerk-Fehler (Timeout oder Host nicht erreichbar): {e}"
-        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
-        return False, msg
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.sendmail(SMTP_FROM, to, msg.as_string())
+        return True
     except Exception as e:
-        msg = f"Unbekannter Fehler: {type(e).__name__}: {e}"
-        print(f"[PPS] SMTP: {msg}", file=sys.stderr)
-        return False, msg
+        print(f"[PPS] SMTP error: {e}")
+        return False
 
 def _gen_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits
@@ -1393,7 +1368,7 @@ def _notify_error(message: str):
           <b>Meldung:</b> {message}<br><br>
           <small style="color:#9a9a94">PPS Backend &mdash; Automatische Benachrichtigung</small>
         </div>"""
-        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)  # Tuple wird ignoriert
+        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)
     except Exception:
         pass  # Notification darf nie einen weiteren Fehler verursachen
 
@@ -1486,7 +1461,7 @@ def request_trial(req: TrialRequest):
       </div>
     </div>"""
 
-    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)  # noqa
+    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)
 
     # Notify studio
     notify_html = f"""
@@ -1498,7 +1473,7 @@ def request_trial(req: TrialRequest):
       Passwort: {password}<br>
       Zeitpunkt: {now_str}
     </div>"""
-    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)  # noqa
+    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)
 
     return {"success": True, "message": f"Test-Zugang fuer {email} angelegt. Bitte E-Mail pruefen."}
 
@@ -2000,11 +1975,11 @@ def smtp_test(admin_email: str, admin_password: str):
       An: {NOTIFY_EMAIL}<br><br>
       <small style="color:#9a9a94">PPS Admin &mdash; SMTP-Test</small>
     </div>"""
-    ok, err = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
+    ok = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
     if ok:
-        return {"success": True, "message": f"✓ Test-Mail an {NOTIFY_EMAIL} gesendet."}
+        return {"success": True, "message": f"Test-Mail an {NOTIFY_EMAIL} gesendet."}
     else:
-        raise HTTPException(500, f"SMTP-Fehler: {err}")
+        raise HTTPException(500, "SMTP-Versand fehlgeschlagen. Bitte Variablen pruefen.")
 
 @app.post("/admin/users/{email}/upgrade")
 def upgrade_user(email: str, admin_email: str, admin_password: str):
@@ -2140,7 +2115,7 @@ def report_issue(req: IssueReport):
             NOTIFY_EMAIL,
             f"PPS Fehlerbericht: {req.user} &mdash; {req.message[:60]}",
             html
-        )  # noqa — Ergebnis wird nicht benötigt
+        )
         return {"success": True}
     except Exception as e:
         print(f"[PPS] report-issue error: {e}", file=sys.stderr)
@@ -2185,7 +2160,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "2.1.2"}
+    return {"status": "ok", "service": "PPS API", "version": "2.3.2"}
 
 if __name__ == "__main__":
     import uvicorn
