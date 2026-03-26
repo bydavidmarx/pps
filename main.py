@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.8
+Backend API · Version 2.3.9
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -1183,20 +1183,11 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         )
         canvas_buf = None
 
-        # ── TrimBox setzen ──
-        # MediaBox = volle Seite inkl. Beschnitt (new_w × new_h)
-        # TrimBox  = Netto-Motiv ohne Beschnitt (B Punkte Einzug auf allen Seiten)
-        # Drucker und Cutter brauchen diese Information für die Schnittmarken
-        trim_rect = fitz.Rect(B, B, new_w - B, new_h - B)
-        new_page.set_trimbox(trim_rect)
-        print(f"[PPS] TrimBox gesetzt: {trim_rect} (Beschnitt: {B:.2f} pt = {B * PT_TO_MM:.1f} mm)", file=__import__('sys').stderr)
-
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
         _gc.collect()
 
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
-        fixes_applied.append(f"TrimBox gesetzt: Nettogröße {round(W * PT_TO_MM, 1)} × {round(H * PT_TO_MM, 1)} mm")
         return pdf_bytes, fixes_applied
 
     pdf_bytes = doc.tobytes(garbage=4, deflate=True)
@@ -1220,13 +1211,16 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "supersize")
 UPSTASH_URL    = os.environ.get("UPSTASH_URL", "").rstrip("/")
 UPSTASH_TOKEN  = os.environ.get("UPSTASH_TOKEN", "")
 
-# SMTP config (Railway env vars)
-SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+# Formspree config (primär — kein SMTP nötig)
+FORMSPREE_ID   = os.environ.get("FORMSPREE_ID", "xaqlyark")
+NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "hello@studiomarx.com")
+
+# SMTP config (Fallback — optional)
+SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.ionos.de")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER      = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD  = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM      = os.environ.get("SMTP_FROM", "noreply@pps.live")
-NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "hello@studiomarx.com")
+SMTP_FROM      = os.environ.get("SMTP_FROM", "hello@studiomarx.com")
 
 TRIAL_LIMIT    = int(os.environ.get("TRIAL_LIMIT", "20"))
 
@@ -1328,7 +1322,7 @@ def _upstash_incr(key: str) -> int:
         return 0
 
 # ─────────────────────────────────────────────
-#  SMTP E-MAIL
+#  BENACHRICHTIGUNGEN via Formspree (primär) + SMTP (Fallback)
 # ─────────────────────────────────────────────
 import smtplib
 import random
@@ -1337,26 +1331,94 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime as _dt
 
-def _send_email(to: str, subject: str, html: str, text: str = ""):
+
+def _send_via_formspree(subject: str, message: str) -> tuple:
+    """
+    Sendet eine Nachricht via Formspree REST API.
+    Gibt (success: bool, error: str) zurück.
+    """
+    try:
+        url = f"https://formspree.io/f/{FORMSPREE_ID}"
+        payload = json.dumps({
+            "_subject": subject,
+            "message": message,
+            "_replyto": NOTIFY_EMAIL,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+            if body.get("ok"):
+                print(f"[PPS] Formspree OK: '{subject}'", file=sys.stderr)
+                return True, ""
+            else:
+                err = body.get("error", "Unbekannte Antwort von Formspree")
+                print(f"[PPS] Formspree Fehler: {err}", file=sys.stderr)
+                return False, err
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        err = f"Formspree HTTP {e.code}: {body[:200]}"
+        print(f"[PPS] {err}", file=sys.stderr)
+        return False, err
+    except Exception as e:
+        err = f"Formspree Verbindungsfehler: {type(e).__name__}: {e}"
+        print(f"[PPS] {err}", file=sys.stderr)
+        return False, err
+
+
+def _send_via_smtp(to: str, subject: str, html: str) -> tuple:
+    """SMTP-Fallback. Gibt (success: bool, error: str) zurück."""
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False
+        return False, "SMTP_USER oder SMTP_PASSWORD nicht gesetzt"
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = f"PPS <{SMTP_FROM}>"
         msg["To"]      = to
-        if text:
-            msg.attach(MIMEText(text, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASSWORD)
-            s.sendmail(SMTP_FROM, to, msg.as_string())
-        return True
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo()
+                s.login(SMTP_USER, SMTP_PASSWORD)
+                s.sendmail(SMTP_FROM, to, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo(); s.starttls(); s.ehlo()
+                s.login(SMTP_USER, SMTP_PASSWORD)
+                s.sendmail(SMTP_FROM, to, msg.as_string())
+        print(f"[PPS] SMTP OK: Mail an {to}", file=sys.stderr)
+        return True, ""
     except Exception as e:
-        print(f"[PPS] SMTP error: {e}")
-        return False
+        err = f"{type(e).__name__}: {e}"
+        print(f"[PPS] SMTP Fehler: {err}", file=sys.stderr)
+        return False, err
+
+
+def _send_email(to: str, subject: str, html: str, text: str = "") -> tuple:
+    """
+    Sendet Benachrichtigung: erst Formspree, dann SMTP als Fallback.
+    Gibt (success: bool, error: str) zurück.
+    """
+    # 1. Formspree (primär — kein Firewall-Problem auf Railway)
+    if FORMSPREE_ID:
+        # HTML → lesbaren Text für Formspree extrahieren
+        import re as _re
+        plain = _re.sub(r'<[^>]+>', ' ', html).strip()
+        plain = _re.sub(r'\s+', ' ', plain)
+        ok, err = _send_via_formspree(subject, plain)
+        if ok:
+            return True, ""
+        print(f"[PPS] Formspree fehlgeschlagen, versuche SMTP: {err}", file=sys.stderr)
+
+    # 2. SMTP (Fallback)
+    return _send_via_smtp(to, subject, html)
 
 def _gen_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits
@@ -1374,7 +1436,7 @@ def _notify_error(message: str):
           <b>Meldung:</b> {message}<br><br>
           <small style="color:#9a9a94">PPS Backend &mdash; Automatische Benachrichtigung</small>
         </div>"""
-        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)
+        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)  # Tuple ignoriert
     except Exception:
         pass  # Notification darf nie einen weiteren Fehler verursachen
 
@@ -1467,7 +1529,7 @@ def request_trial(req: TrialRequest):
       </div>
     </div>"""
 
-    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)
+    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)  # noqa
 
     # Notify studio
     notify_html = f"""
@@ -1479,7 +1541,7 @@ def request_trial(req: TrialRequest):
       Passwort: {password}<br>
       Zeitpunkt: {now_str}
     </div>"""
-    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)
+    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)  # noqa
 
     return {"success": True, "message": f"Test-Zugang fuer {email} angelegt. Bitte E-Mail pruefen."}
 
@@ -1970,22 +2032,24 @@ def get_global_notifications():
 
 @app.post("/admin/smtp-test")
 def smtp_test(admin_email: str, admin_password: str):
-    """Sends a test email to the admin address."""
+    """Sendet eine Test-Nachricht via Formspree (primär) oder SMTP (Fallback)."""
     if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
         raise HTTPException(403, "Nicht autorisiert.")
     from datetime import datetime as _dt3
+    now_str = _dt3.now().strftime("%d.%m.%Y %H:%M:%S")
+    subject = "✓ PPS Benachrichtigungs-Test"
     html = f"""<div style="font-family:monospace;padding:1.5rem;color:#1a1a18">
-      <strong style="color:#2d5a3d">&#10003; PPS SMTP Test erfolgreich</strong><br><br>
-      Zeitpunkt: {_dt3.now().strftime("%d.%m.%Y %H:%M:%S")}<br>
-      Von: {SMTP_FROM}<br>
-      An: {NOTIFY_EMAIL}<br><br>
-      <small style="color:#9a9a94">PPS Admin &mdash; SMTP-Test</small>
+      <strong style="color:#2d5a3d">&#10003; PPS Test erfolgreich</strong><br><br>
+      Zeitpunkt: {now_str}<br>
+      An: {NOTIFY_EMAIL}<br>
+      Kanal: {'Formspree' if FORMSPREE_ID else 'SMTP'}<br><br>
+      <small style="color:#9a9a94">PPS Admin &mdash; Benachrichtigungs-Test</small>
     </div>"""
-    ok = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
+    ok, err = _send_email(NOTIFY_EMAIL, subject, html)
     if ok:
-        return {"success": True, "message": f"Test-Mail an {NOTIFY_EMAIL} gesendet."}
+        return {"success": True, "message": f"✓ Test-Nachricht gesendet an {NOTIFY_EMAIL}"}
     else:
-        raise HTTPException(500, "SMTP-Versand fehlgeschlagen. Bitte Variablen pruefen.")
+        raise HTTPException(500, f"Fehler: {err}")
 
 @app.post("/admin/users/{email}/upgrade")
 def upgrade_user(email: str, admin_email: str, admin_password: str):
@@ -2119,9 +2183,9 @@ def report_issue(req: IssueReport):
 
         _send_email(
             NOTIFY_EMAIL,
-            f"PPS Fehlerbericht: {req.user} &mdash; {req.message[:60]}",
+            f"PPS Fehlerbericht: {req.user} — {req.message[:60]}",
             html
-        )
+        )  # noqa
         return {"success": True}
     except Exception as e:
         print(f"[PPS] report-issue error: {e}", file=sys.stderr)
@@ -2166,7 +2230,7 @@ def debug_store():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "2.1.2"}
+    return {"status": "ok", "service": "PPS API", "version": "2.3.2"}
 
 if __name__ == "__main__":
     import uvicorn
