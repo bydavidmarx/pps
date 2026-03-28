@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.4.0
+Backend API · Version 2.4.1
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -76,10 +76,6 @@ async def analyze(
     data = await file.read()
     if len(data) > 100 * 1024 * 1024:
         raise HTTPException(413, "Datei zu groß (max. 100 MB).")
-
-    # Usage tracking
-    if user_email:
-        _track_usage(user_email.strip().lower(), len(data))
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -1212,6 +1208,13 @@ import urllib.parse
 
 ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL", "dm@dcp-online.de")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "supersize")
+
+# Kommagetrennte Admin-E-Mails unterstützen
+_ADMIN_EMAILS  = [e.strip().lower() for e in ADMIN_EMAIL.split(",") if e.strip()]
+
+def _is_admin(email: str, password: str) -> bool:
+    """Prüft ob E-Mail + Passwort einem Admin-Account entsprechen."""
+    return email.strip().lower() in _ADMIN_EMAILS and password == ADMIN_PASSWORD
 UPSTASH_URL    = os.environ.get("UPSTASH_URL", "").rstrip("/")
 UPSTASH_TOKEN  = os.environ.get("UPSTASH_TOKEN", "")
 
@@ -1275,45 +1278,6 @@ def save_users(users: dict):
         raise HTTPException(500, f"Upstash Fehler {e.code}: {body}")
     except Exception as e:
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
-
-# ─────────────────────────────────────────────
-#  USAGE TRACKING (Analysen + MB pro User/Monat)
-# ─────────────────────────────────────────────
-def _get_current_month() -> str:
-    from datetime import datetime
-    return datetime.utcnow().strftime("%Y-%m")
-
-def _track_usage(email: str, file_size_bytes: int):
-    if not email:
-        return
-    key = f"pps_usage:{email.strip().lower()}"
-    current_month = _get_current_month()
-    try:
-        raw = _upstash_get(key)
-        data = json.loads(raw) if raw else {}
-        if data.get("month") != current_month:
-            data = {"month": current_month, "analyses": 0, "mb": 0.0}
-        data["analyses"] = data.get("analyses", 0) + 1
-        data["mb"] = round(data.get("mb", 0.0) + file_size_bytes / 1024 / 1024, 2)
-        _upstash_set(key, json.dumps(data))
-    except Exception as e:
-        print(f"[PPS] usage tracking error: {e}", file=sys.stderr)
-
-def _get_usage(email: str) -> dict:
-    current_month = _get_current_month()
-    if not email:
-        return {"analyses": 0, "mb": 0.0, "month": current_month}
-    key = f"pps_usage:{email.strip().lower()}"
-    try:
-        raw = _upstash_get(key)
-        if not raw:
-            return {"analyses": 0, "mb": 0.0, "month": current_month}
-        data = json.loads(raw)
-        if data.get("month") != current_month:
-            return {"analyses": 0, "mb": 0.0, "month": current_month}
-        return {"analyses": data.get("analyses", 0), "mb": round(data.get("mb", 0.0), 2), "month": current_month}
-    except Exception:
-        return {"analyses": 0, "mb": 0.0, "month": current_month}
 
 # ─────────────────────────────────────────────
 #  UPSTASH HELPERS: TRIAL STORE
@@ -1524,8 +1488,13 @@ def login(
 ):
     email = email.strip().lower()
     password = password.strip()
-    if email == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
-        return {"success": True, "role": "admin", "name": "Admin"}
+    if _is_admin(email, password):
+        admin_names = {
+            "dm@dcp-online.de":      "David Marx",
+            "o.knaup@dcp-online.de": "O. Knaup",
+        }
+        name = admin_names.get(email, "Admin")
+        return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
         return {"success": True, "role": "customer", "name": users[email]["name"]}
@@ -1535,8 +1504,13 @@ def login(
 def login_get(email: str, password: str):
     email = email.strip().lower()
     password = password.strip()
-    if email == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
-        return {"success": True, "role": "admin", "name": "Admin"}
+    if _is_admin(email, password):
+        admin_names = {
+            "dm@dcp-online.de":      "David Marx",
+            "o.knaup@dcp-online.de": "O. Knaup",
+        }
+        name = admin_names.get(email, "Admin")
+        return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
         return {"success": True, "role": "customer", "name": users[email]["name"]}
@@ -1544,14 +1518,14 @@ def login_get(email: str, password: str):
 
 @app.get("/admin/users")
 def get_users(admin_email: str, admin_password: str):
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     users = load_users()
     return {"users": [{"email": e, "name": d.get("name",""), "role": d.get("role","customer"), "company": d.get("company","")} for e, d in users.items()]}
 
 @app.post("/admin/users")
 def create_user(req: UserRequest, admin_email: str, admin_password: str):
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     users = load_users()
     email = req.email.strip().lower()
@@ -1561,7 +1535,7 @@ def create_user(req: UserRequest, admin_email: str, admin_password: str):
 
 @app.delete("/admin/users/{email}")
 def delete_user(email: str, admin_email: str, admin_password: str):
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     users = load_users()
     email = email.strip().lower()
@@ -1954,7 +1928,7 @@ class NotificationMsg(BaseModel):
 @app.post("/admin/notification")
 def push_notification(req: NotificationMsg, admin_email: str, admin_password: str):
     """Pushes a notification to all users via Upstash."""
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     from datetime import datetime as _dt2
     notif = {
@@ -1978,7 +1952,7 @@ def push_notification(req: NotificationMsg, admin_email: str, admin_password: st
 
 @app.get("/admin/notifications")
 def get_notifications(admin_email: str, admin_password: str):
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     raw = _upstash_get("pps_global_notifications") or "[]"
     try:
@@ -1988,7 +1962,7 @@ def get_notifications(admin_email: str, admin_password: str):
 
 @app.delete("/admin/notifications")
 def clear_notifications(admin_email: str, admin_password: str):
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     _upstash_set("pps_global_notifications", "[]")
     return {"success": True}
@@ -2005,7 +1979,7 @@ def get_global_notifications():
 @app.post("/admin/smtp-test")
 def smtp_test(admin_email: str, admin_password: str):
     """Sends a test email to the admin address."""
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     from datetime import datetime as _dt3
     html = f"""<div style="font-family:monospace;padding:1.5rem;color:#1a1a18">
@@ -2024,7 +1998,7 @@ def smtp_test(admin_email: str, admin_password: str):
 @app.post("/admin/users/{email}/upgrade")
 def upgrade_user(email: str, admin_email: str, admin_password: str):
     """Upgrades a trial user to full customer."""
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     users = load_users()
     email = email.strip().lower()
@@ -2039,7 +2013,7 @@ def upgrade_user(email: str, admin_email: str, admin_password: str):
 @app.get("/admin/stats")
 def get_stats(admin_email: str, admin_password: str):
     """Returns trial and user statistics."""
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     users = load_users()
     trials = {e: u for e, u in users.items() if u.get("role") == "trial"}
@@ -2090,7 +2064,7 @@ def get_banner():
 @app.post("/system/banner")
 def set_banner(req: BannerUpdate, admin_email: str, admin_password: str):
     """Setzt oder loescht die System-Bannermeldung (nur Admin)."""
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     if req.message:
         _upstash_set("pps_banner", json.dumps({
@@ -2168,7 +2142,7 @@ def report_issue(req: IssueReport):
 @app.get("/admin/config")
 def get_admin_config(admin_email: str, admin_password: str):
     """Returns safe admin configuration values (no passwords)."""
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+    if not _is_admin(admin_email, admin_password):
         raise HTTPException(403, "Nicht autorisiert.")
     return {
         "smtp_host": SMTP_HOST or "(nicht gesetzt)",
@@ -2198,49 +2172,12 @@ def debug_store():
     except Exception as e:
         return {"error": str(e)}
 
-@app.get("/admin/usage-all")
-def get_all_usage(admin_email: str, admin_password: str):
-    """Liefert Verbrauchsstatistik aller User für den aktuellen Monat."""
-    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
-        raise HTTPException(403, "Nicht autorisiert.")
-    users = load_users()
-    result = []
-    current_month = _get_current_month()
-    for email, udata in users.items():
-        usage = _get_usage(email)
-        result.append({
-            "email": email,
-            "name": udata.get("name", ""),
-            "role": udata.get("role", "customer"),
-            "analyses": usage.get("analyses", 0),
-            "mb": usage.get("mb", 0.0),
-            "month": usage.get("month", current_month),
-        })
-    # Sortiert nach Analysen absteigend
-    result.sort(key=lambda x: x["analyses"], reverse=True)
-    # Gesamt-Summen
-    total_analyses = sum(r["analyses"] for r in result)
-    total_mb = round(sum(r["mb"] for r in result), 2)
-    return {
-        "month": current_month,
-        "users": result,
-        "total_analyses": total_analyses,
-        "total_mb": total_mb,
-    }
-
-@app.get("/usage")
-def get_usage(email: str, password: str):
-    """Liefert Nutzungsstatistik für den eingeloggten User."""
-    email = email.strip().lower()
-    users = load_users()
-    if email not in users or users[email]["password"] != password:
-        raise HTTPException(401, "Nicht autorisiert.")
-    return _get_usage(email)
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "2.3.2"}
+    return {"status": "ok", "service": "PPS API", "version": "2.1.2"}
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    
+
