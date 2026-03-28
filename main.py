@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.9
+Backend API · Version 2.4.0
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -1277,10 +1277,6 @@ def save_users(users: dict):
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
 
 # ─────────────────────────────────────────────
-#  UPSTASH HELPERS: TRIAL STORE
-# ─────────────────────────────────────────────
-
-# ─────────────────────────────────────────────
 #  USAGE TRACKING (Analysen + MB pro User/Monat)
 # ─────────────────────────────────────────────
 def _get_current_month() -> str:
@@ -1288,7 +1284,6 @@ def _get_current_month() -> str:
     return datetime.utcnow().strftime("%Y-%m")
 
 def _track_usage(email: str, file_size_bytes: int):
-    """Zählt Analysen und MB pro User. Reset automatisch jeden Monat."""
     if not email:
         return
     key = f"pps_usage:{email.strip().lower()}"
@@ -1305,7 +1300,6 @@ def _track_usage(email: str, file_size_bytes: int):
         print(f"[PPS] usage tracking error: {e}", file=sys.stderr)
 
 def _get_usage(email: str) -> dict:
-    """Liefert aktuelle Nutzungsstatistik für einen User."""
     current_month = _get_current_month()
     if not email:
         return {"analyses": 0, "mb": 0.0, "month": current_month}
@@ -1320,6 +1314,10 @@ def _get_usage(email: str) -> dict:
         return {"analyses": data.get("analyses", 0), "mb": round(data.get("mb", 0.0), 2), "month": current_month}
     except Exception:
         return {"analyses": 0, "mb": 0.0, "month": current_month}
+
+# ─────────────────────────────────────────────
+#  UPSTASH HELPERS: TRIAL STORE
+# ─────────────────────────────────────────────
 
 def _upstash_get(key: str):
     if not UPSTASH_URL or not UPSTASH_TOKEN:
@@ -1530,8 +1528,7 @@ def login(
         return {"success": True, "role": "admin", "name": "Admin"}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"],
-                "usage": _get_usage(email)}
+        return {"success": True, "role": "customer", "name": users[email]["name"]}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/login")
@@ -1542,8 +1539,7 @@ def login_get(email: str, password: str):
         return {"success": True, "role": "admin", "name": "Admin"}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"],
-                "usage": _get_usage(email)}
+        return {"success": True, "role": "customer", "name": users[email]["name"]}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/admin/users")
@@ -2201,6 +2197,36 @@ def debug_store():
         return {"error": f"HTTP {e.code}", "body": e.read().decode()}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/admin/usage-all")
+def get_all_usage(admin_email: str, admin_password: str):
+    """Liefert Verbrauchsstatistik aller User für den aktuellen Monat."""
+    if admin_email.lower() != ADMIN_EMAIL.lower() or admin_password != ADMIN_PASSWORD:
+        raise HTTPException(403, "Nicht autorisiert.")
+    users = load_users()
+    result = []
+    current_month = _get_current_month()
+    for email, udata in users.items():
+        usage = _get_usage(email)
+        result.append({
+            "email": email,
+            "name": udata.get("name", ""),
+            "role": udata.get("role", "customer"),
+            "analyses": usage.get("analyses", 0),
+            "mb": usage.get("mb", 0.0),
+            "month": usage.get("month", current_month),
+        })
+    # Sortiert nach Analysen absteigend
+    result.sort(key=lambda x: x["analyses"], reverse=True)
+    # Gesamt-Summen
+    total_analyses = sum(r["analyses"] for r in result)
+    total_mb = round(sum(r["mb"] for r in result), 2)
+    return {
+        "month": current_month,
+        "users": result,
+        "total_analyses": total_analyses,
+        "total_mb": total_mb,
+    }
 
 @app.get("/usage")
 def get_usage(email: str, password: str):
