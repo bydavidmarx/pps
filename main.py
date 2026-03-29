@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.3.2
+Backend API · Version 2.4.1
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -692,86 +692,33 @@ def analyze_colorspace(page, doc, raw_bytes):
     elif 3 in cs_set and 4 not in cs_set:
         is_rgb = True
     elif 4 in cs_set and 3 in cs_set:
-        is_mixed = True; is_cmyk = False
+        is_mixed = True
+        is_cmyk = False
 
-    # ── ICC: direkt aus PDF-Streams lesen (korrekte Methode) ──
-    def _read_icc_desc(icc_bytes):
-        try:
-            if len(icc_bytes) < 132: return ""
-            tag_count = struct.unpack_from('>I', icc_bytes, 128)[0]
-            if tag_count > 100: return ""
-            for i in range(tag_count):
-                base = 132 + i * 12
-                if base + 12 > len(icc_bytes): break
-                sig    = icc_bytes[base:base+4]
-                offset = struct.unpack_from('>I', icc_bytes, base+4)[0]
-                size   = struct.unpack_from('>I', icc_bytes, base+8)[0]
-                if sig == b'desc':
-                    data = icc_bytes[offset:offset+size]
-                    if data[:4] == b'desc' and len(data) >= 12:
-                        length = struct.unpack_from('>I', data, 8)[0]
-                        return data[12:12+length].rstrip(b'\x00').decode('ascii', errors='replace').strip()
-                    elif data[:4] == b'mluc' and len(data) >= 24:
-                        slen = struct.unpack_from('>I', data, 16)[0]
-                        soff = struct.unpack_from('>I', data, 20)[0]
-                        if soff + slen <= len(data):
-                            return data[soff:soff+slen].decode('utf-16-be', errors='replace').rstrip('\x00').strip()
-        except Exception:
-            pass
-        return ""
+    # ICC profile extraction from raw PDF bytes
+    icc_markers = [b"/ICCBased", b"ICCProfile", b"icc", b"ICC"]
+    raw_lower = raw_bytes.lower()
 
-    def _normalize_icc(raw):
-        nl = raw.lower()
-        if "iso coated v2" in nl or "isocoated_v2" in nl: return "ISO Coated v2 (ECI)", True
-        if "fogra39" in nl: return "ISO Coated v2 / Fogra39", True
-        if "fogra51" in nl: return "ISO Uncoated v2 / Fogra51", False
-        if "fogra" in nl: return raw, False
-        if "srgb" in nl or "iec61966" in nl: return "sRGB IEC61966", False
-        if "adobe rgb" in nl: return "Adobe RGB (1998)", False
-        if "display p3" in nl: return "Display P3", False
-        if "prophoto" in nl: return "ProPhoto RGB", False
-        return raw, False
+    known_profiles = {
+        b"iso coated v2": "ISO Coated v2 (ECI)",
+        b"isocoated_v2": "ISO Coated v2 (ECI)",
+        b"fogra39": "ISO Coated v2 / Fogra39",
+        b"fogra51": "ISO Uncoated v2 / Fogra51",
+        b"srgb": "sRGB IEC61966",
+        b"adobe rgb": "Adobe RGB (1998)",
+        b"p3": "Display P3",
+    }
+    for marker, name in known_profiles.items():
+        if marker in raw_lower:
+            icc_name = name
+            icc_ok = "iso coated v2" in name.lower() or "fogra39" in name.lower()
+            break
 
-    # Primär: ICC-Streams aus PDF
-    try:
-        for xref in range(1, doc.xref_length()):
-            try:
-                if not doc.xref_is_stream(xref): continue
-                obj_str = doc.xref_object(xref, compressed=False)
-                if '/N ' not in obj_str and '/N\n' not in obj_str: continue
-                if any(k in obj_str for k in ['/Subtype', '/Width', '/Height', '/BitsPerComponent']): continue
-                icc_bytes = doc.xref_stream(xref)
-                if not icc_bytes or len(icc_bytes) < 132: continue
-                if len(icc_bytes) >= 40 and icc_bytes[36:40] == b'acsp':
-                    desc = _read_icc_desc(icc_bytes)
-                    if desc:
-                        icc_name, icc_ok = _normalize_icc(desc)
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # Fallback: Substring-Scan (nur lange, eindeutige Strings — KEIN kurzes "p3")
     if not icc_name:
-        raw_lower = raw_bytes.lower()
-        for marker, name, ok in [
-            (b"iso coated v2",    "ISO Coated v2 (ECI)",       True),
-            (b"isocoated_v2",     "ISO Coated v2 (ECI)",       True),
-            (b"fogra39",          "ISO Coated v2 / Fogra39",   True),
-            (b"fogra51",          "ISO Uncoated v2 / Fogra51", False),
-            (b"adobe rgb (1998)", "Adobe RGB (1998)",           False),
-            (b"adobe rgb",        "Adobe RGB (1998)",           False),
-            (b"display p3",       "Display P3",                False),
-            (b"srgb iec61966",    "sRGB IEC61966",             False),
-        ]:
-            if marker in raw_lower:
-                icc_name, icc_ok = name, ok
-                break
-    if not icc_name:
-        raw_lower = raw_bytes.lower()
+        # Try to find any ICC keyword
         if b"/iccbased" in raw_lower or b"iccprofile" in raw_lower:
             icc_name = "ICC-Profil gefunden (Name nicht lesbar)"
+            icc_ok = False
 
     cs_parts = []
     if is_cmyk: cs_parts.append("CMYK")
@@ -934,8 +881,8 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
 
             # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
             # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
-            target_dpi_1to1 = 100.0
-            factor = min(target_dpi_1to1 / dpi_1to1, 4.0)  # max 4x upscale
+            target_dpi = 100.0
+            factor = min(target_dpi / dpi_1to1, 4.0)  # max 4x upscale
             to_upscale.append({
                 "xref": xref,
                 "rect": r,
@@ -1168,10 +1115,8 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         import io as _io
         import gc as _gc
 
-        # Renderauflösung: Ziel 50 DPI bei 1:1-Druckgröße → im Dokument 50×scale DPI
-        # Begrenzt auf 600 DPI als RAM-Schutz
-        dpi = max(min(int(50 * scale), 600), 100)
-        print(f"[PPS] bleed render: {dpi} DPI im Dokument = {dpi//scale} DPI@1:1 (scale={scale})", file=sys.stderr)
+        # Randstreifen als Pixmaps rendern — 100 DPI statt 150 spart ~55% RAM
+        dpi = 100
         sf = dpi / 72.0
 
         def render_strip(x0, y0, x1, y1):
@@ -1242,16 +1187,11 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         )
         canvas_buf = None
 
-        # TrimBox setzen — Drucker/Cutter wissen damit wo das Motiv endet
-        trim_rect = fitz.Rect(B, B, new_w - B, new_h - B)
-        new_page.set_trimbox(trim_rect)
-
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
         _gc.collect()
 
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
-        fixes_applied.append(f"TrimBox gesetzt: {round(W*PT_TO_MM,1)} × {round(H*PT_TO_MM,1)} mm")
         return pdf_bytes, fixes_applied
 
     pdf_bytes = doc.tobytes(garbage=4, deflate=True)
@@ -1282,13 +1222,12 @@ def _is_admin(email: str, password: str) -> bool:
 UPSTASH_URL    = os.environ.get("UPSTASH_URL", "").rstrip("/")
 UPSTASH_TOKEN  = os.environ.get("UPSTASH_TOKEN", "")
 
-# Formspree (primär) + SMTP (Fallback)
-FORMSPREE_ID   = os.environ.get("FORMSPREE_ID", "xaqlyark")
-SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.ionos.de")
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "465"))
+# SMTP config (Railway env vars)
+SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER      = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD  = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM      = os.environ.get("SMTP_FROM", "hello@studiomarx.com")
+SMTP_FROM      = os.environ.get("SMTP_FROM", "noreply@pps.live")
 NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "hello@studiomarx.com")
 
 TRIAL_LIMIT    = int(os.environ.get("TRIAL_LIMIT", "20"))
@@ -1364,7 +1303,6 @@ def _track_usage(email: str, file_size_bytes: int):
         data["mb"] = round(data.get("mb", 0.0) + file_size_bytes / 1024 / 1024, 2)
         _upstash_set(key, json.dumps(data))
     except Exception as e:
-        import sys
         print(f"[PPS] usage tracking error: {e}", file=sys.stderr)
 
 def _get_usage(email: str) -> dict:
@@ -1436,55 +1374,26 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime as _dt
 
-def _send_via_formspree(subject: str, message: str) -> tuple:
-    try:
-        url = f"https://formspree.io/f/{FORMSPREE_ID}"
-        payload = json.dumps({"_subject": subject, "message": message, "_replyto": NOTIFY_EMAIL}).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read().decode())
-            if body.get("ok"):
-                return True, ""
-            return False, body.get("error", "Unbekannte Antwort")
-    except urllib.error.HTTPError as e:
-        return False, f"Formspree HTTP {e.code}: {e.read().decode(errors='replace')[:200]}"
-    except Exception as e:
-        return False, f"Formspree Fehler: {type(e).__name__}: {e}"
-
-def _send_via_smtp(to: str, subject: str, html: str) -> tuple:
+def _send_email(to: str, subject: str, html: str, text: str = ""):
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False, "SMTP_USER oder SMTP_PASSWORD nicht gesetzt"
+        return False
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = f"PPS <{SMTP_FROM}>"
         msg["To"]      = to
+        if text:
+            msg.attach(MIMEText(text, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo(); s.login(SMTP_USER, SMTP_PASSWORD)
-                s.sendmail(SMTP_FROM, to, msg.as_string())
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo(); s.starttls(); s.ehlo()
-                s.login(SMTP_USER, SMTP_PASSWORD)
-                s.sendmail(SMTP_FROM, to, msg.as_string())
-        return True, ""
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.sendmail(SMTP_FROM, to, msg.as_string())
+        return True
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def _send_email(to: str, subject: str, html: str, text: str = "") -> tuple:
-    """Formspree primär, SMTP als Fallback. Gibt (success, error) zurück."""
-    if FORMSPREE_ID:
-        import re as _re
-        plain = _re.sub(r'<[^>]+>', ' ', html).strip()
-        plain = _re.sub(r'\s+', ' ', plain)
-        ok, err = _send_via_formspree(subject, plain)
-        if ok:
-            return True, ""
-        print(f"[PPS] Formspree fehlgeschlagen: {err}", file=sys.stderr)
-    return _send_via_smtp(to, subject, html)
+        print(f"[PPS] SMTP error: {e}")
+        return False
 
 def _gen_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits
@@ -1502,7 +1411,7 @@ def _notify_error(message: str):
           <b>Meldung:</b> {message}<br><br>
           <small style="color:#9a9a94">PPS Backend &mdash; Automatische Benachrichtigung</small>
         </div>"""
-        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)  # noqa
+        _send_email(NOTIFY_EMAIL, f"&#9888; PPS Fehler: {message[:60]}", html)
     except Exception:
         pass  # Notification darf nie einen weiteren Fehler verursachen
 
@@ -1595,7 +1504,7 @@ def request_trial(req: TrialRequest):
       </div>
     </div>"""
 
-    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)  # noqa
+    _send_email(email, f"Ihr PPS Test-Zugang — {TRIAL_LIMIT} Analysen warten auf Sie", welcome_html)
 
     # Notify studio
     notify_html = f"""
@@ -1607,7 +1516,7 @@ def request_trial(req: TrialRequest):
       Passwort: {password}<br>
       Zeitpunkt: {now_str}
     </div>"""
-    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)  # noqa
+    _send_email(NOTIFY_EMAIL, f"PPS Trial: {name} ({company})", notify_html)
 
     return {"success": True, "message": f"Test-Zugang fuer {email} angelegt. Bitte E-Mail pruefen."}
 
@@ -1627,8 +1536,7 @@ def login(
         return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"],
-                "usage": _get_usage(email)}
+        return {"success": True, "role": "customer", "name": users[email]["name"], "usage": _get_usage(email)}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/login")
@@ -1644,8 +1552,7 @@ def login_get(email: str, password: str):
         return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"],
-                "usage": _get_usage(email)}
+        return {"success": True, "role": "customer", "name": users[email]["name"], "usage": _get_usage(email)}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/admin/users")
@@ -2121,11 +2028,11 @@ def smtp_test(admin_email: str, admin_password: str):
       An: {NOTIFY_EMAIL}<br><br>
       <small style="color:#9a9a94">PPS Admin &mdash; SMTP-Test</small>
     </div>"""
-    ok, err = _send_email(NOTIFY_EMAIL, "✓ PPS Benachrichtigungs-Test", html)
+    ok = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
     if ok:
-        return {"success": True, "message": f"✓ Test-Nachricht gesendet an {NOTIFY_EMAIL}"}
+        return {"success": True, "message": f"Test-Mail an {NOTIFY_EMAIL} gesendet."}
     else:
-        raise HTTPException(500, f"Fehler: {err}")
+        raise HTTPException(500, "SMTP-Versand fehlgeschlagen. Bitte Variablen pruefen.")
 
 @app.post("/admin/users/{email}/upgrade")
 def upgrade_user(email: str, admin_email: str, admin_password: str):
@@ -2304,6 +2211,28 @@ def debug_store():
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/track")
+def track_usage(req: dict):
+    """
+    Leichtgewichtiger Usage-Tracking Endpoint für lokale Analysen.
+    Wird von der Desktop-App aufgerufen wenn kein Upload stattfindet.
+    """
+    try:
+        email    = req.get("email", "").strip().lower()
+        password = req.get("password", "").strip()
+        size_mb  = float(req.get("size_mb", 0))
+        if not email: return {"success": False}
+        # Auth prüfen
+        users = load_users()
+        if email not in users or users[email].get("password") != password:
+            return {"success": False}
+        # Tracking: size_mb in bytes umrechnen für _track_usage
+        _track_usage(email, int(size_mb * 1024 * 1024))
+        return {"success": True, "usage": _get_usage(email)}
+    except Exception as e:
+        print(f"[PPS] /track error: {e}", file=sys.stderr)
+        return {"success": False}
+
 @app.get("/usage")
 def get_usage_endpoint(email: str, password: str):
     """Liefert Nutzungsstatistik für den eingeloggten User."""
@@ -2324,8 +2253,7 @@ def get_all_usage(admin_email: str, admin_password: str):
     for email, udata in users.items():
         usage = _get_usage(email)
         result.append({
-            "email": email,
-            "name": udata.get("name", ""),
+            "email": email, "name": udata.get("name", ""),
             "role": udata.get("role", "customer"),
             "analyses": usage.get("analyses", 0),
             "mb": usage.get("mb", 0.0),
@@ -2333,8 +2261,7 @@ def get_all_usage(admin_email: str, admin_password: str):
         })
     result.sort(key=lambda x: x["analyses"], reverse=True)
     return {
-        "month": month,
-        "users": result,
+        "month": month, "users": result,
         "total_analyses": sum(r["analyses"] for r in result),
         "total_mb": round(sum(r["mb"] for r in result), 2),
     }
