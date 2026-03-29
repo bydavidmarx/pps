@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.4.2
+Backend API · Version 2.4.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
