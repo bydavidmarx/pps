@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.4.3
+Backend API · Version 2.4.1
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -76,10 +76,6 @@ async def analyze(
     data = await file.read()
     if len(data) > 100 * 1024 * 1024:
         raise HTTPException(413, "Datei zu groß (max. 100 MB).")
-
-    # Usage tracking
-    if user_email:
-        _track_usage(user_email.strip().lower(), len(data))
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -1284,41 +1280,6 @@ def save_users(users: dict):
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
 
 # ─────────────────────────────────────────────
-#  USAGE TRACKING
-# ─────────────────────────────────────────────
-def _get_current_month() -> str:
-    from datetime import datetime
-    return datetime.utcnow().strftime("%Y-%m")
-
-def _track_usage(email: str, file_size_bytes: int):
-    if not email: return
-    key = f"pps_usage:{email.strip().lower()}"
-    month = _get_current_month()
-    try:
-        raw = _upstash_get(key)
-        data = json.loads(raw) if raw else {}
-        if data.get("month") != month:
-            data = {"month": month, "analyses": 0, "mb": 0.0}
-        data["analyses"] = data.get("analyses", 0) + 1
-        data["mb"] = round(data.get("mb", 0.0) + file_size_bytes / 1024 / 1024, 2)
-        _upstash_set(key, json.dumps(data))
-    except Exception as e:
-        print(f"[PPS] usage tracking error: {e}", file=sys.stderr)
-
-def _get_usage(email: str) -> dict:
-    month = _get_current_month()
-    if not email: return {"analyses": 0, "mb": 0.0, "month": month}
-    key = f"pps_usage:{email.strip().lower()}"
-    try:
-        raw = _upstash_get(key)
-        if not raw: return {"analyses": 0, "mb": 0.0, "month": month}
-        data = json.loads(raw)
-        if data.get("month") != month: return {"analyses": 0, "mb": 0.0, "month": month}
-        return {"analyses": data.get("analyses", 0), "mb": round(data.get("mb", 0.0), 2), "month": month}
-    except Exception:
-        return {"analyses": 0, "mb": 0.0, "month": month}
-
-# ─────────────────────────────────────────────
 #  UPSTASH HELPERS: TRIAL STORE
 # ─────────────────────────────────────────────
 
@@ -1536,7 +1497,7 @@ def login(
         return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"], "usage": _get_usage(email)}
+        return {"success": True, "role": "customer", "name": users[email]["name"]}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/login")
@@ -1552,7 +1513,7 @@ def login_get(email: str, password: str):
         return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"], "usage": _get_usage(email)}
+        return {"success": True, "role": "customer", "name": users[email]["name"]}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/admin/users")
@@ -2211,60 +2172,82 @@ def debug_store():
     except Exception as e:
         return {"error": str(e)}
 
-@app.post("/track")
-def track_usage(req: dict):
+# ─────────────────────────────────────────────
+#  ENTERPRISE: ANGEBOT PARSEN (Claude API Proxy)
+# ─────────────────────────────────────────────
+class ParseOfferRequest(BaseModel):
+    pdf_text: str
+    filename: Optional[str] = ""
+
+@app.post("/parse-offer")
+def parse_offer(req: ParseOfferRequest):
     """
-    Leichtgewichtiger Usage-Tracking Endpoint für lokale Analysen.
-    Wird von der Desktop-App aufgerufen wenn kein Upload stattfindet.
+    Sendet den extrahierten PDF-Text an Claude und gibt strukturierte
+    Angebotsdaten als JSON zurück. Löst CORS-Problem durch Server-Proxy.
     """
+    import urllib.request as _ur
+    import urllib.error as _ue
+
+    ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not ANTHROPIC_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY nicht gesetzt.")
+
+    prompt = f"""Du bist ein Daten-Extraktor für DCP Digitaldruck Angebote. Extrahiere aus diesem Angebots-Text alle relevanten Informationen.
+
+Antworte NUR mit einem validen JSON-Objekt, ohne Markdown-Backticks, ohne Erklärungen:
+{{
+  "angebot_nr": "...",
+  "datum": "...",
+  "kd_nr": "...",
+  "kunde": "...",
+  "projekt": "...",
+  "objekt_bez": "...",
+  "ansprechpartner": "...",
+  "objekte": [
+    {{ "name": "...", "breite_mm": 1234, "hoehe_mm": 5678, "menge": 1 }}
+  ],
+  "gesamtbetrag": "...",
+  "lieferzeit": "..."
+}}
+
+Wichtig:
+- breite_mm und hoehe_mm sind die Druckabmessungen in Millimetern (als Zahl, ohne "mm")
+- Extrahiere ALLE Objekte/Motive mit ihren genauen Maßen
+- Falls ein Wert nicht gefunden wird, nutze null
+
+Angebots-Text:
+{req.pdf_text[:8000]}"""
+
+    payload = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1000,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode("utf-8")
+
     try:
-        email    = req.get("email", "").strip().lower()
-        password = req.get("password", "").strip()
-        size_mb  = float(req.get("size_mb", 0))
-        if not email: return {"success": False}
-        # Auth prüfen
-        users = load_users()
-        if email not in users or users[email].get("password") != password:
-            return {"success": False}
-        # Tracking: size_mb in bytes umrechnen für _track_usage
-        _track_usage(email, int(size_mb * 1024 * 1024))
-        return {"success": True, "usage": _get_usage(email)}
+        request = _ur.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+            }
+        )
+        with _ur.urlopen(request, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            raw_text = result["content"][0]["text"].strip()
+            clean = raw_text.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(clean)
+            return {"success": True, "data": parsed}
+    except _ue.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise HTTPException(500, f"Claude API Fehler {e.code}: {body[:300]}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"JSON-Parse-Fehler: {str(e)}")
     except Exception as e:
-        print(f"[PPS] /track error: {e}", file=sys.stderr)
-        return {"success": False}
-
-@app.get("/usage")
-def get_usage_endpoint(email: str, password: str):
-    """Liefert Nutzungsstatistik für den eingeloggten User."""
-    email = email.strip().lower()
-    users = load_users()
-    if email not in users or users[email]["password"] != password:
-        raise HTTPException(401, "Nicht autorisiert.")
-    return _get_usage(email)
-
-@app.get("/admin/usage-all")
-def get_all_usage(admin_email: str, admin_password: str):
-    """Liefert Verbrauchsstatistik aller User für den aktuellen Monat."""
-    if not _is_admin(admin_email, admin_password):
-        raise HTTPException(403, "Nicht autorisiert.")
-    users = load_users()
-    month = _get_current_month()
-    result = []
-    for email, udata in users.items():
-        usage = _get_usage(email)
-        result.append({
-            "email": email, "name": udata.get("name", ""),
-            "role": udata.get("role", "customer"),
-            "analyses": usage.get("analyses", 0),
-            "mb": usage.get("mb", 0.0),
-            "month": usage.get("month", month),
-        })
-    result.sort(key=lambda x: x["analyses"], reverse=True)
-    return {
-        "month": month, "users": result,
-        "total_analyses": sum(r["analyses"] for r in result),
-        "total_mb": round(sum(r["mb"] for r in result), 2),
-    }
+        raise HTTPException(500, f"Fehler: {type(e).__name__}: {str(e)[:200]}")
 
 @app.get("/health")
 def health():
