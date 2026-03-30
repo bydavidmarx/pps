@@ -77,6 +77,9 @@ async def analyze(
     if len(data) > 100 * 1024 * 1024:
         raise HTTPException(413, "Datei zu groß (max. 100 MB).")
 
+    if user_email:
+        _track_usage(user_email.strip().lower(), len(data))
+
     try:
         doc = fitz.open(stream=data, filetype="pdf")
     except Exception:
@@ -124,6 +127,9 @@ async def fix_pdf(
     data = await file.read()
     if len(data) > 100 * 1024 * 1024:
         raise HTTPException(413, "Datei zu groß (max. 100 MB).")
+
+    if user_email:
+        _track_usage(user_email.strip().lower(), len(data))
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -1231,11 +1237,12 @@ UPSTASH_URL    = os.environ.get("UPSTASH_URL", "").rstrip("/")
 UPSTASH_TOKEN  = os.environ.get("UPSTASH_TOKEN", "")
 
 # SMTP config (Railway env vars)
-SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+FORMSPREE_ID   = os.environ.get("FORMSPREE_ID", "xaqlyark")
+SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.ionos.de")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER      = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD  = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM      = os.environ.get("SMTP_FROM", "noreply@pps.live")
+SMTP_FROM      = os.environ.get("SMTP_FROM", "hello@studiomarx.com")
 NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "hello@studiomarx.com")
 
 TRIAL_LIMIT    = int(os.environ.get("TRIAL_LIMIT", "20"))
@@ -1290,6 +1297,41 @@ def save_users(users: dict):
         raise HTTPException(500, f"Upstash Fehler {e.code}: {body}")
     except Exception as e:
         raise HTTPException(500, f"Speichern fehlgeschlagen: {str(e)}")
+
+# ─────────────────────────────────────────────
+#  USAGE TRACKING
+# ─────────────────────────────────────────────
+def _get_current_month() -> str:
+    from datetime import datetime
+    return datetime.utcnow().strftime("%Y-%m")
+
+def _track_usage(email: str, file_size_bytes: int):
+    if not email: return
+    key = f"pps_usage:{email.strip().lower()}"
+    month = _get_current_month()
+    try:
+        raw = _upstash_get(key)
+        data = json.loads(raw) if raw else {}
+        if data.get("month") != month:
+            data = {"month": month, "analyses": 0, "mb": 0.0}
+        data["analyses"] = data.get("analyses", 0) + 1
+        data["mb"] = round(data.get("mb", 0.0) + file_size_bytes / 1024 / 1024, 2)
+        _upstash_set(key, json.dumps(data))
+    except Exception as e:
+        print(f"[PPS] usage tracking error: {e}", file=sys.stderr)
+
+def _get_usage(email: str) -> dict:
+    month = _get_current_month()
+    if not email: return {"analyses": 0, "mb": 0.0, "month": month}
+    key = f"pps_usage:{email.strip().lower()}"
+    try:
+        raw = _upstash_get(key)
+        if not raw: return {"analyses": 0, "mb": 0.0, "month": month}
+        data = json.loads(raw)
+        if data.get("month") != month: return {"analyses": 0, "mb": 0.0, "month": month}
+        return {"analyses": data.get("analyses", 0), "mb": round(data.get("mb", 0.0), 2), "month": month}
+    except Exception:
+        return {"analyses": 0, "mb": 0.0, "month": month}
 
 # ─────────────────────────────────────────────
 #  UPSTASH HELPERS: TRIAL STORE
@@ -1347,26 +1389,46 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime as _dt
 
-def _send_email(to: str, subject: str, html: str, text: str = ""):
+def _send_via_formspree(subject: str, message: str) -> tuple:
+    try:
+        url = f"https://formspree.io/f/{FORMSPREE_ID}"
+        payload = json.dumps({"_subject": subject, "message": message, "_replyto": NOTIFY_EMAIL}).encode()
+        req = urllib.request.Request(url, data=payload, method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+            return (True, "") if body.get("ok") else (False, body.get("error", "Fehler"))
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+def _send_via_smtp(to: str, subject: str, html: str) -> tuple:
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False
+        return False, "SMTP nicht konfiguriert"
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = f"PPS <{SMTP_FROM}>"
-        msg["To"]      = to
-        if text:
-            msg.attach(MIMEText(text, "plain", "utf-8"))
+        msg["Subject"] = subject; msg["From"] = f"PPS <{SMTP_FROM}>"; msg["To"] = to
         msg.attach(MIMEText(html, "html", "utf-8"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASSWORD)
-            s.sendmail(SMTP_FROM, to, msg.as_string())
-        return True
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo(); s.login(SMTP_USER, SMTP_PASSWORD); s.sendmail(SMTP_FROM, to, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo(); s.starttls(); s.ehlo(); s.login(SMTP_USER, SMTP_PASSWORD); s.sendmail(SMTP_FROM, to, msg.as_string())
+        return True, ""
     except Exception as e:
-        print(f"[PPS] SMTP error: {e}")
-        return False
+        return False, f"{type(e).__name__}: {e}"
+
+def _send_email(to: str, subject: str, html: str, text: str = "") -> tuple:
+    if FORMSPREE_ID:
+        import re as _re
+        plain = _re.sub(r'<[^>]+>', ' ', html).strip()
+        plain = _re.sub(r'\s+', ' ', plain)
+        ok, err = _send_via_formspree(subject, plain)
+        if ok: return True, ""
+        print(f"[PPS] Formspree: {err}", file=sys.stderr)
+    return _send_via_smtp(to, subject, html)
 
 def _gen_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits
@@ -1509,7 +1571,7 @@ def login(
         return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"]}
+        return {"success": True, "role": "customer", "name": users[email]["name"], "usage": _get_usage(email)}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/login")
@@ -1525,7 +1587,7 @@ def login_get(email: str, password: str):
         return {"success": True, "role": "admin", "name": name}
     users = load_users()
     if email in users and users[email]["password"] == password:
-        return {"success": True, "role": "customer", "name": users[email]["name"]}
+        return {"success": True, "role": "customer", "name": users[email]["name"], "usage": _get_usage(email)}
     raise HTTPException(401, "E-Mail oder Passwort ungültig.")
 
 @app.get("/admin/users")
@@ -2001,11 +2063,11 @@ def smtp_test(admin_email: str, admin_password: str):
       An: {NOTIFY_EMAIL}<br><br>
       <small style="color:#9a9a94">PPS Admin &mdash; SMTP-Test</small>
     </div>"""
-    ok = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
+    ok, err = _send_email(NOTIFY_EMAIL, "✓ PPS Test", html)
     if ok:
-        return {"success": True, "message": f"Test-Mail an {NOTIFY_EMAIL} gesendet."}
+        return {"success": True, "message": f"✓ Gesendet an {NOTIFY_EMAIL}"}
     else:
-        raise HTTPException(500, "SMTP-Versand fehlgeschlagen. Bitte Variablen pruefen.")
+        raise HTTPException(500, f"Fehler: {err}")
 
 @app.post("/admin/users/{email}/upgrade")
 def upgrade_user(email: str, admin_email: str, admin_password: str):
@@ -2184,9 +2246,76 @@ def debug_store():
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/track")
+def track_usage(req: dict):
+    try:
+        email = req.get("email","").strip().lower()
+        password = req.get("password","").strip()
+        size_mb = float(req.get("size_mb", 0))
+        if not email: return {"success": False}
+        users = load_users()
+        if email not in users or users[email].get("password") != password:
+            return {"success": False}
+        _track_usage(email, int(size_mb * 1024 * 1024))
+        return {"success": True, "usage": _get_usage(email)}
+    except Exception as e:
+        print(f"[PPS] /track error: {e}", file=sys.stderr)
+        return {"success": False}
+
+@app.get("/usage")
+def get_usage_endpoint(email: str, password: str):
+    email = email.strip().lower()
+    users = load_users()
+    if email not in users or users[email]["password"] != password:
+        raise HTTPException(401, "Nicht autorisiert.")
+    return _get_usage(email)
+
+@app.get("/admin/usage-all")
+def get_all_usage(admin_email: str, admin_password: str):
+    if not _is_admin(admin_email, admin_password):
+        raise HTTPException(403, "Nicht autorisiert.")
+    users = load_users()
+    month = _get_current_month()
+    result = []
+    for email, udata in users.items():
+        usage = _get_usage(email)
+        result.append({"email": email, "name": udata.get("name",""),
+            "role": udata.get("role","customer"),
+            "analyses": usage.get("analyses",0), "mb": usage.get("mb",0.0),
+            "month": usage.get("month",month)})
+    result.sort(key=lambda x: x["analyses"], reverse=True)
+    return {"month": month, "users": result,
+            "total_analyses": sum(r["analyses"] for r in result),
+            "total_mb": round(sum(r["mb"] for r in result), 2)}
+
+@app.post("/parse-offer")
+def parse_offer(req: dict):
+    import urllib.error as _ue
+    ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not ANTHROPIC_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY nicht gesetzt.")
+    pdf_text = req.get("pdf_text", "")[:8000]
+    prompt = f"""Extrahiere aus diesem DCP Angebots-Text alle Informationen. Antworte NUR mit JSON ohne Backticks:
+{{"angebot_nr":"...","datum":"...","kd_nr":"...","kunde":"...","projekt":"...","objekt_bez":"...","ansprechpartner":"...","objekte":[{{"name":"...","breite_mm":1234,"hoehe_mm":5678,"menge":1}}],"gesamtbetrag":"...","lieferzeit":"..."}}
+Text:
+{pdf_text}"""
+    payload = json.dumps({"model":"claude-sonnet-4-20250514","max_tokens":1000,
+        "messages":[{"role":"user","content":prompt}]}).encode()
+    try:
+        req2 = urllib.request.Request("https://api.anthropic.com/v1/messages",
+            data=payload, method="POST",
+            headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,
+                     "anthropic-version":"2023-06-01"})
+        with urllib.request.urlopen(req2, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            raw = result["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
+            return {"success": True, "data": json.loads(raw)}
+    except Exception as e:
+        raise HTTPException(500, f"Fehler: {type(e).__name__}: {str(e)[:200]}")
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PPS API", "version": "2.1.2"}
+    return {"status": "ok", "service": "PPS API", "version": "2.3.2"}
 
 if __name__ == "__main__":
     import uvicorn
