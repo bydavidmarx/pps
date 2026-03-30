@@ -697,27 +697,87 @@ def analyze_colorspace(page, doc, raw_bytes):
         is_mixed = True
         is_cmyk = False
 
-    # ICC profile extraction from raw PDF bytes
-    icc_markers = [b"/ICCBased", b"ICCProfile", b"icc", b"ICC"]
-    raw_lower = raw_bytes.lower()
+    # ── ICC-Profil: direkt aus PDF-Streams lesen ──
+    # Methode 1: Echte ICC-Streams via `acsp`-Signatur erkennen und desc-Tag parsen
+    def _read_icc_desc(icc_bytes):
+        """Liest den 'desc' Tag aus einem ICC-Profil-Byte-String."""
+        try:
+            if len(icc_bytes) < 132: return ""
+            tag_count = struct.unpack_from('>I', icc_bytes, 128)[0]
+            if tag_count > 200: return ""
+            for i in range(tag_count):
+                base = 132 + i * 12
+                if base + 12 > len(icc_bytes): break
+                sig    = icc_bytes[base:base+4]
+                offset = struct.unpack_from('>I', icc_bytes, base+4)[0]
+                size   = struct.unpack_from('>I', icc_bytes, base+8)[0]
+                if sig == b'desc':
+                    d = icc_bytes[offset:offset+size]
+                    if d[:4] == b'desc' and len(d) >= 12:
+                        ln = struct.unpack_from('>I', d, 8)[0]
+                        return d[12:12+ln].rstrip(b'\x00').decode('ascii', errors='replace').strip()
+                    elif d[:4] == b'mluc' and len(d) >= 24:
+                        sl = struct.unpack_from('>I', d, 16)[0]
+                        so = struct.unpack_from('>I', d, 20)[0]
+                        if so + sl <= len(d):
+                            return d[so:so+sl].decode('utf-16-be', errors='replace').rstrip('\x00').strip()
+        except Exception:
+            pass
+        return ""
 
-    known_profiles = {
-        b"iso coated v2": "ISO Coated v2 (ECI)",
-        b"isocoated_v2": "ISO Coated v2 (ECI)",
-        b"fogra39": "ISO Coated v2 / Fogra39",
-        b"fogra51": "ISO Uncoated v2 / Fogra51",
-        b"srgb": "sRGB IEC61966",
-        b"adobe rgb": "Adobe RGB (1998)",
-        b"p3": "Display P3",
-    }
-    for marker, name in known_profiles.items():
-        if marker in raw_lower:
-            icc_name = name
-            icc_ok = "iso coated v2" in name.lower() or "fogra39" in name.lower()
-            break
+    def _normalize_icc(raw):
+        """Normalisiert ICC-Profilnamen auf bekannte Werte."""
+        nl = raw.lower()
+        if "iso coated v2" in nl or "isocoated_v2" in nl: return "ISO Coated v2 (ECI)", True
+        if "fogra39" in nl:   return "ISO Coated v2 / Fogra39", True
+        if "fogra51" in nl:   return "ISO Uncoated v2 / Fogra51", False
+        if "fogra" in nl:     return raw, False
+        if "srgb" in nl or "iec61966" in nl: return "sRGB IEC61966", False
+        if "adobe rgb" in nl: return "Adobe RGB (1998)", False
+        if "display p3" in nl: return "Display P3", False   # nur exakter Name
+        if "prophoto" in nl:  return "ProPhoto RGB", False
+        return raw, False
+
+    # Primär: echte ICC-Streams aus dem PDF parsen
+    try:
+        for xref in range(1, doc.xref_length()):
+            try:
+                if not doc.xref_is_stream(xref): continue
+                obj_str = doc.xref_object(xref, compressed=False)
+                # Nur echte ICC-Profile: /N (Kanalanzahl) ohne Bild-Attribute
+                if '/N ' not in obj_str and '/N\n' not in obj_str: continue
+                if any(k in obj_str for k in ['/Subtype', '/Width', '/Height', '/BitsPerComponent']): continue
+                icc_bytes = doc.xref_stream(xref)
+                if not icc_bytes or len(icc_bytes) < 132: continue
+                # ICC-Signatur bei Byte 36: 'acsp'
+                if icc_bytes[36:40] != b'acsp': continue
+                desc = _read_icc_desc(icc_bytes)
+                if desc:
+                    icc_name, icc_ok = _normalize_icc(desc)
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Fallback: nur lange, eindeutige Strings im Rohtext — KEIN kurzes "p3"
+    if not icc_name:
+        rl = raw_bytes.lower()
+        for marker, name, ok in [
+            (b"iso coated v2",    "ISO Coated v2 (ECI)",       True),
+            (b"isocoated_v2",     "ISO Coated v2 (ECI)",       True),
+            (b"fogra39",          "ISO Coated v2 / Fogra39",   True),
+            (b"fogra51",          "ISO Uncoated v2 / Fogra51", False),
+            (b"display p3",       "Display P3",                False),  # nur exakter Ausdruck
+            (b"srgb iec61966",    "sRGB IEC61966",             False),
+            (b"adobe rgb (1998)", "Adobe RGB (1998)",           False),
+        ]:
+            if marker in rl:
+                icc_name, icc_ok = name, ok
+                break
 
     if not icc_name:
-        # Try to find any ICC keyword
+        raw_lower = raw_bytes.lower()
         if b"/iccbased" in raw_lower or b"iccprofile" in raw_lower:
             icc_name = "ICC-Profil gefunden (Name nicht lesbar)"
             icc_ok = False
