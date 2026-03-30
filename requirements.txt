@@ -6,3 +6,4 @@ pillow==10.4.0
 python-multipart==0.0.9
 pikepdf==9.4.0
 reportlab==4.2.5
+# v2.3.2
