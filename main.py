@@ -2253,38 +2253,39 @@ class IssueReport(BaseModel):
 
 @app.post("/report-issue")
 def report_issue(req: IssueReport):
-    """Empfaengt Fehlerberichte von Nutzern und schickt sie per E-Mail."""
+    """Empfaengt Fehlerberichte von Nutzern — schickt E-Mail mit Screenshot."""
     try:
+        has_screenshot = bool(req.screenshot and req.screenshot.startswith("data:image"))
         screenshot_html = ""
-        if req.screenshot and req.screenshot.startswith("data:image"):
-            screenshot_html = f'''
-            <div style="margin-top:1rem">
-              <div style="font-size:10px;color:#9a9a94;margin-bottom:.5rem;font-family:monospace;text-transform:uppercase;letter-spacing:.1em">Screenshot</div>
-              <img src="{req.screenshot}" style="width:100%;border:1px solid #d0cdc4;border-radius:3px" alt="Screenshot">
-            </div>'''
+        if has_screenshot:
+            screenshot_html = f'<div style="margin-top:1rem"><div style="font-size:10px;color:#9a9a94;margin-bottom:.5rem;font-family:monospace;text-transform:uppercase;letter-spacing:.1em">Screenshot</div><img src="{req.screenshot}" style="width:100%;border:1px solid #d0cdc4;border-radius:3px" alt="Screenshot"></div>'
 
-        html = f"""
-        <div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
+        html = f"""<div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
           <div style="background:#f5f3ee;border-left:3px solid #c0392b;padding:1rem;margin-bottom:1.5rem">
-            <strong style="color:#c0392b">&#9888; Neuer Fehlerbericht</strong>
+            <strong style="color:#c0392b">&#9888; PPS Fehlerbericht</strong>
           </div>
           <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:1rem">
             <tr><td style="color:#9a9a94;padding:4px 8px;width:120px">Nutzer</td><td style="padding:4px 8px"><b>{req.user}</b></td></tr>
             <tr><td style="color:#9a9a94;padding:4px 8px">Seite</td><td style="padding:4px 8px">{req.page}</td></tr>
             <tr><td style="color:#9a9a94;padding:4px 8px">Zeitpunkt</td><td style="padding:4px 8px">{req.timestamp}</td></tr>
           </table>
-          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">
-            {req.message}
-          </div>
+          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">{req.message}</div>
           {screenshot_html}
-          <div style="margin-top:1.5rem;font-size:10px;color:#9a9a94">PPS XPRESS &mdash; Automatischer Fehlerbericht</div>
+          <div style="margin-top:1.5rem;font-size:10px;color:#9a9a94">PPS XPRESS &mdash; {req.backend or ''}</div>
         </div>"""
 
-        _send_email(
+        ok, err = _send_email(
             NOTIFY_EMAIL,
-            f"PPS Fehlerbericht: {req.user} &mdash; {req.message[:60]}",
+            f"\u26a0\ufe0f PPS Fehlerbericht: {req.user} \u2014 {req.message[:60]}",
             html
         )
+        if not ok:
+            print(f"[PPS] report-issue SMTP error: {err}", file=sys.stderr)
+            # Formspree fallback (kein Screenshot, aber Nachricht kommt an)
+            _send_via_formspree(
+                f"PPS Fehlerbericht: {req.user}",
+                f"Von: {req.user}\nZeit: {req.timestamp}\nSeite: {req.page}\n\n{req.message}\n\nScreenshot: {'Ja (nur per SMTP verfügbar)' if has_screenshot else 'Nein'}"
+            )
         return {"success": True}
     except Exception as e:
         print(f"[PPS] report-issue error: {e}", file=sys.stderr)
