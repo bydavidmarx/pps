@@ -122,6 +122,7 @@ async def fix_pdf(
     fix_colorspace: bool = Form(False),
     fix_resolution: bool = Form(False),
     job_name: Optional[str] = Form(""),
+    user_email: Optional[str] = Form(""),
 ):
     import gc, asyncio
     data = await file.read()
@@ -215,7 +216,7 @@ async def fix_pdf(
                 bad = [i for i in imgs if i.get("dpi_at_1to1", 0) < 25]
                 if bad:
                     fixes_applied.append(
-                        f"Hinweis: {len(bad)} Bild(er) unter 25 DPI wurden hochgerechnet "
+                        f"Hinweis: {len(bad)} Bild(er) unter 25 PPI wurden hochgerechnet "
                         f"— Druckqualitaet koennte beeintraechtigt sein"
                     )
 
@@ -304,16 +305,34 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
     # Regel: Wenn TrimBox vorhanden, ist die Differenz MediaBox-TrimBox = echter Beschnitt
     # Beschnittzeichen liegen AUSSERHALB der TrimBox → ändern nichts an der Beschnitt-Berechnung
     # Nur wenn KEINE TrimBox: können wir keinen Beschnitt erkennen
+    bleed_in_page = False
     if trimbox:
         bleed_mm = ((media_w_mm - trim_w_mm) / 2 + (media_h_mm - trim_h_mm) / 2) / 2
-        # Wenn Beschnittzeichen vorhanden aber kein echter Beschnitt (TrimBox = MediaBox)
-        # dann ist bleed_mm = 0, was korrekt ist
     else:
-        bleed_mm = 0.0
+        excess_w = trim_w_mm - expected_w_mm
+        excess_h = trim_h_mm - expected_h_mm
+        tol = expected_bleed_mm * 0.30
+        if (excess_w > expected_bleed_mm * 1.2 and
+            abs((excess_w/2) - expected_bleed_mm) < tol and
+            abs((excess_h/2) - expected_bleed_mm) < tol):
+            bleed_mm = (excess_w/2 + excess_h/2) / 2
+            bleed_in_page = True
+        elif excess_w > expected_bleed_mm * 1.5:
+            bleed_mm = (excess_w/2 + excess_h/2) / 2
+            bleed_in_page = True
+        else:
+            bleed_mm = 0.0
 
-    # ── Ratio check (immer auf TrimBox-Basis) ──
-    ratio_diff_w = abs(trim_w_mm - expected_w_mm)
-    ratio_diff_h = abs(trim_h_mm - expected_h_mm)
+    # ── Ratio check ──
+    if bleed_in_page:
+        net_w_mm = trim_w_mm - 2 * bleed_mm
+        net_h_mm = trim_h_mm - 2 * bleed_mm
+    else:
+        net_w_mm = trim_w_mm
+        net_h_mm = trim_h_mm
+
+    ratio_diff_w = abs(net_w_mm - expected_w_mm)
+    ratio_diff_h = abs(net_h_mm - expected_h_mm)
     ratio_ok = ratio_diff_w < 3 and ratio_diff_h < 3
 
     # ── Bleed Status ──
@@ -602,27 +621,27 @@ def evaluate_images(images, min_dpi, critical_dpi, scale):
     min_in_doc  = min(i["dpi_in_doc"]  for i in valid)
     max_in_doc  = max(i["dpi_in_doc"]  for i in valid)
 
-    min_print = 50.0   # Minimum DPI bei 1:1
+    min_print = 50.0   # Minimum PPI bei 1:1
     crit_print = 25.0  # Kritisch — zu niedrig für Upscaling
 
     below_min  = [i for i in valid if i["dpi_at_1to1"] < min_print]
     below_crit = [i for i in valid if i["dpi_at_1to1"] < crit_print]
 
     value = (f"{len(images)} Bild(er) · "
-             f"{min_in_doc:.0f}–{max_in_doc:.0f} DPI im Dokument "
-             f"(= {min_at_1to1:.0f}–{max_at_1to1:.0f} DPI bei 1:1)")
+             f"{min_in_doc:.0f}–{max_in_doc:.0f} PPI im Dokument "
+             f"(= {min_at_1to1:.0f}–{max_at_1to1:.0f} PPI bei 1:1)")
 
     if below_crit:
         return ("error", value,
-                f"{len(below_crit)} Bild(er) unter {crit_print:.0f} DPI (1:1). "
+                f"{len(below_crit)} Bild(er) unter {crit_print:.0f} PPI (1:1). "
                 f"Zu niedrig für Upscaling — bitte Originaldatei in höherer Auflösung liefern.")
     elif below_min:
         return ("warn", value,
-                f"{len(below_min)} Bild(er) unter {min_print:.0f} DPI (1:1). "
+                f"{len(below_min)} Bild(er) unter {min_print:.0f} PPI (1:1). "
                 f"Upscaling (2×) über 'Fix It' möglich.")
     else:
         return ("ok", value,
-                f"Alle Bilder erreichen mindestens {min_print:.0f} DPI bei 1:1. Auflösung ausreichend.")
+                f"Alle Bilder erreichen mindestens {min_print:.0f} PPI bei 1:1. Auflösung ausreichend.")
 
 
 # ─────────────────────────────────────────────
@@ -697,70 +716,60 @@ def analyze_colorspace(page, doc, raw_bytes):
         is_mixed = True
         is_cmyk = False
 
-    # ── ICC-Profil: direkt aus PDF-Streams lesen ──
-    # Methode 1: Echte ICC-Streams via `acsp`-Signatur erkennen und desc-Tag parsen
-    def _read_icc_desc(icc_bytes):
-        """Liest den 'desc' Tag aus einem ICC-Profil-Byte-String."""
+    # ── ICC: direkt aus PDF-Streams lesen ──
+    def _read_icc_desc(b):
         try:
-            if len(icc_bytes) < 132: return ""
-            tag_count = struct.unpack_from('>I', icc_bytes, 128)[0]
-            if tag_count > 200: return ""
-            for i in range(tag_count):
-                base = 132 + i * 12
-                if base + 12 > len(icc_bytes): break
-                sig    = icc_bytes[base:base+4]
-                offset = struct.unpack_from('>I', icc_bytes, base+4)[0]
-                size   = struct.unpack_from('>I', icc_bytes, base+8)[0]
-                if sig == b'desc':
-                    d = icc_bytes[offset:offset+size]
-                    if d[:4] == b'desc' and len(d) >= 12:
-                        ln = struct.unpack_from('>I', d, 8)[0]
-                        return d[12:12+ln].rstrip(b'\x00').decode('ascii', errors='replace').strip()
-                    elif d[:4] == b'mluc' and len(d) >= 24:
-                        sl = struct.unpack_from('>I', d, 16)[0]
-                        so = struct.unpack_from('>I', d, 20)[0]
-                        if so + sl <= len(d):
-                            return d[so:so+sl].decode('utf-16-be', errors='replace').rstrip('\x00').strip()
+            if len(b) < 132: return ""
+            tc = struct.unpack_from(">I", b, 128)[0]
+            if tc > 200: return ""
+            for i in range(tc):
+                base = 132 + i*12
+                if base+12 > len(b): break
+                sig = b[base:base+4]
+                off = struct.unpack_from(">I", b, base+4)[0]
+                sz  = struct.unpack_from(">I", b, base+8)[0]
+                if sig == b"desc":
+                    d = b[off:off+sz]
+                    if d[:4] == b"desc" and len(d) >= 12:
+                        ln = struct.unpack_from(">I", d, 8)[0]
+                        return d[12:12+ln].rstrip(b"\x00").decode("ascii","replace").strip()
+                    elif d[:4] == b"mluc" and len(d) >= 24:
+                        sl = struct.unpack_from(">I", d, 16)[0]
+                        so = struct.unpack_from(">I", d, 20)[0]
+                        if so+sl <= len(d):
+                            return d[so:so+sl].decode("utf-16-be","replace").rstrip("\x00").strip()
         except Exception:
             pass
         return ""
 
     def _normalize_icc(raw):
-        """Normalisiert ICC-Profilnamen auf bekannte Werte."""
         nl = raw.lower()
         if "iso coated v2" in nl or "isocoated_v2" in nl: return "ISO Coated v2 (ECI)", True
-        if "fogra39" in nl:   return "ISO Coated v2 / Fogra39", True
-        if "fogra51" in nl:   return "ISO Uncoated v2 / Fogra51", False
-        if "fogra" in nl:     return raw, False
+        if "fogra39" in nl: return "ISO Coated v2 / Fogra39", True
+        if "fogra51" in nl: return "ISO Uncoated v2 / Fogra51", False
         if "srgb" in nl or "iec61966" in nl: return "sRGB IEC61966", False
         if "adobe rgb" in nl: return "Adobe RGB (1998)", False
-        if "display p3" in nl: return "Display P3", False   # nur exakter Name
-        if "prophoto" in nl:  return "ProPhoto RGB", False
+        if "display p3" in nl: return "Display P3", False
         return raw, False
 
-    # Primär: echte ICC-Streams aus dem PDF parsen
     try:
         for xref in range(1, doc.xref_length()):
             try:
                 if not doc.xref_is_stream(xref): continue
                 obj_str = doc.xref_object(xref, compressed=False)
-                # Nur echte ICC-Profile: /N (Kanalanzahl) ohne Bild-Attribute
-                if '/N ' not in obj_str and '/N\n' not in obj_str: continue
-                if any(k in obj_str for k in ['/Subtype', '/Width', '/Height', '/BitsPerComponent']): continue
+                if "/N " not in obj_str and "/N\n" not in obj_str: continue
+                if any(k in obj_str for k in ["/Subtype","/Width","/Height","/BitsPerComponent"]): continue
                 icc_bytes = doc.xref_stream(xref)
-                if not icc_bytes or len(icc_bytes) < 132: continue
-                # ICC-Signatur bei Byte 36: 'acsp'
-                if icc_bytes[36:40] != b'acsp': continue
-                desc = _read_icc_desc(icc_bytes)
-                if desc:
-                    icc_name, icc_ok = _normalize_icc(desc)
-                    break
+                if icc_bytes and len(icc_bytes) >= 40 and icc_bytes[36:40] == b"acsp":
+                    desc = _read_icc_desc(icc_bytes)
+                    if desc:
+                        icc_name, icc_ok = _normalize_icc(desc)
+                        break
             except Exception:
                 continue
     except Exception:
         pass
 
-    # Fallback: nur lange, eindeutige Strings im Rohtext — KEIN kurzes "p3"
     if not icc_name:
         rl = raw_bytes.lower()
         for marker, name, ok in [
@@ -768,19 +777,15 @@ def analyze_colorspace(page, doc, raw_bytes):
             (b"isocoated_v2",     "ISO Coated v2 (ECI)",       True),
             (b"fogra39",          "ISO Coated v2 / Fogra39",   True),
             (b"fogra51",          "ISO Uncoated v2 / Fogra51", False),
-            (b"display p3",       "Display P3",                False),  # nur exakter Ausdruck
+            (b"display p3",       "Display P3",                False),
             (b"srgb iec61966",    "sRGB IEC61966",             False),
-            (b"adobe rgb (1998)", "Adobe RGB (1998)",           False),
+            (b"adobe rgb",        "Adobe RGB (1998)",           False),
         ]:
             if marker in rl:
                 icc_name, icc_ok = name, ok
                 break
-
-    if not icc_name:
-        raw_lower = raw_bytes.lower()
-        if b"/iccbased" in raw_lower or b"iccprofile" in raw_lower:
-            icc_name = "ICC-Profil gefunden (Name nicht lesbar)"
-            icc_ok = False
+    if not icc_name and (b"/iccbased" in raw_bytes.lower()):
+        icc_name = "ICC-Profil gefunden (Name nicht lesbar)"
 
     cs_parts = []
     if is_cmyk: cs_parts.append("CMYK")
@@ -941,7 +946,7 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             if dpi_1to1 >= min_dpi_1to1:
                 continue  # bereits gut genug — kein Upscaling nötig
 
-            # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
+            # Alle unter 50 PPI werden hochgerechnet (auch unter 25 PPI)
             # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
             target_dpi = 100.0
             factor = min(target_dpi / dpi_1to1, 4.0)  # max 4x upscale
@@ -1029,7 +1034,7 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                         upscaled_count += 1
                         new_dpi = item["dpi_1to1"] * item["factor"]
                         print(f"[PPS] REPLACED '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
-                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} DPI@1:1", file=sys.stderr)
+                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} PPI@1:1", file=sys.stderr)
                         break
                 except Exception as xe:
                     print(f"[PPS] xobj error {name}: {xe}", file=sys.stderr)
@@ -1157,6 +1162,39 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         trimbox = page.trimbox
         mediabox = page.mediabox
 
+        # Bleed-inklusive Erkennung
+        media_w_pt = mediabox.x1 - mediabox.x0
+        media_h_pt = mediabox.y1 - mediabox.y0
+        expected_w_pt = (print_w / scale) / PT_TO_MM
+        expected_h_pt = (print_h / scale) / PT_TO_MM
+        excess_w_pt = media_w_pt - expected_w_pt
+        excess_h_pt = media_h_pt - expected_h_pt
+        tol_pt = expected_bleed_pt * 0.35
+
+        bleed_in_page = (
+            not has_trimbox and
+            excess_w_pt > expected_bleed_pt * 1.2 and
+            abs(excess_w_pt/2 - expected_bleed_pt) < tol_pt and
+            abs(excess_h_pt/2 - expected_bleed_pt) < tol_pt
+        )
+        if not bleed_in_page and not has_trimbox and excess_w_pt > expected_bleed_pt * 1.5:
+            bleed_in_page = True
+
+        if bleed_in_page:
+            actual_bleed_w = excess_w_pt / 2
+            actual_bleed_h = excess_h_pt / 2
+            trim_rect = fitz.Rect(
+                mediabox.x0 + actual_bleed_w, mediabox.y0 + actual_bleed_h,
+                mediabox.x1 - actual_bleed_w, mediabox.y1 - actual_bleed_h
+            )
+            page.set_trimbox(trim_rect)
+            fixes_applied.append(
+                f"TrimBox gesetzt: Netto {round((trim_rect.x1-trim_rect.x0)*PT_TO_MM,1)} x "
+                f"{round((trim_rect.y1-trim_rect.y0)*PT_TO_MM,1)} mm"
+            )
+            pdf_bytes = doc.tobytes(garbage=4, deflate=True)
+            return pdf_bytes, fixes_applied
+
         if trimbox and trimbox != mediabox:
             clip_rect = trimbox
         else:
@@ -1177,10 +1215,10 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         import io as _io
         import gc as _gc
 
-        # Renderauflösung: Ziel 50 DPI bei 1:1-Druckgröße → im Dokument 50×scale DPI
+        # Renderauflösung: Ziel 50 PPI bei 1:1-Druckgröße → im Dokument 50×scale DPI
         # Begrenzt auf 600 DPI als RAM-Schutz
         dpi = max(min(int(50 * scale), 600), 100)
-        print(f"[PPS] bleed render: {dpi} DPI (scale={scale}, {dpi//scale} DPI@1:1)", file=__import__('sys').stderr)
+        print(f"[PPS] bleed render: {dpi} DPI (scale={scale}, {dpi//scale} PPI@1:1)", file=__import__('sys').stderr)
         sf = dpi / 72.0
 
         def render_strip(x0, y0, x1, y1):
@@ -1197,14 +1235,17 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
             return buf.getvalue()
 
         # Streifen rendern und sofort transformieren
-        strip_l = render_strip(cx0, cy0, cx0 + B, cy1).transpose(Image.FLIP_LEFT_RIGHT)
-        strip_r = render_strip(cx1 - B, cy0, cx1, cy1).transpose(Image.FLIP_LEFT_RIGHT)
-        strip_t = render_strip(cx0, cy0, cx1, cy0 + B).transpose(Image.FLIP_TOP_BOTTOM)
-        strip_b = render_strip(cx0, cy1 - B, cx1, cy1).transpose(Image.FLIP_TOP_BOTTOM)
-        corner_tl = render_strip(cx0, cy0, cx0+B, cy0+B).transpose(Image.ROTATE_180)
-        corner_tr = render_strip(cx1-B, cy0, cx1, cy0+B).transpose(Image.ROTATE_180)
-        corner_bl = render_strip(cx0, cy1-B, cx0+B, cy1).transpose(Image.ROTATE_180)
-        corner_br = render_strip(cx1-B, cy1-B, cx1, cy1).transpose(Image.ROTATE_180)
+        GRAB_MM = 5.0 / scale
+        GRAB_PT = min(GRAB_MM / PT_TO_MM, W*0.15, H*0.15, B)
+        GRAB_PT = max(GRAB_PT, 2.0)
+        strip_l = render_strip(cx0, cy0, cx0+GRAB_PT, cy1).transpose(Image.FLIP_LEFT_RIGHT)
+        strip_r = render_strip(cx1-GRAB_PT, cy0, cx1, cy1).transpose(Image.FLIP_LEFT_RIGHT)
+        strip_t = render_strip(cx0, cy0, cx1, cy0+GRAB_PT).transpose(Image.FLIP_TOP_BOTTOM)
+        strip_b = render_strip(cx0, cy1-GRAB_PT, cx1, cy1).transpose(Image.FLIP_TOP_BOTTOM)
+        corner_tl = render_strip(cx0, cy0, cx0+GRAB_PT, cy0+GRAB_PT).transpose(Image.ROTATE_180)
+        corner_tr = render_strip(cx1-GRAB_PT, cy0, cx1, cy0+GRAB_PT).transpose(Image.ROTATE_180)
+        corner_bl = render_strip(cx0, cy1-GRAB_PT, cx0+GRAB_PT, cy1).transpose(Image.ROTATE_180)
+        corner_br = render_strip(cx1-GRAB_PT, cy1-GRAB_PT, cx1, cy1).transpose(Image.ROTATE_180)
 
         # Vollbild der Originalseite
         full_mat = fitz.Matrix(sf, sf)
@@ -1449,46 +1490,26 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime as _dt
 
-def _send_via_formspree(subject: str, message: str) -> tuple:
-    try:
-        url = f"https://formspree.io/f/{FORMSPREE_ID}"
-        payload = json.dumps({"_subject": subject, "message": message, "_replyto": NOTIFY_EMAIL}).encode()
-        req = urllib.request.Request(url, data=payload, method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read().decode())
-            return (True, "") if body.get("ok") else (False, body.get("error", "Fehler"))
-    except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def _send_via_smtp(to: str, subject: str, html: str) -> tuple:
+def _send_email(to: str, subject: str, html: str, text: str = ""):
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False, "SMTP nicht konfiguriert"
+        return False
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject; msg["From"] = f"PPS <{SMTP_FROM}>"; msg["To"] = to
+        msg["Subject"] = subject
+        msg["From"]    = f"PPS <{SMTP_FROM}>"
+        msg["To"]      = to
+        if text:
+            msg.attach(MIMEText(text, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo(); s.login(SMTP_USER, SMTP_PASSWORD); s.sendmail(SMTP_FROM, to, msg.as_string())
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo(); s.starttls(); s.ehlo(); s.login(SMTP_USER, SMTP_PASSWORD); s.sendmail(SMTP_FROM, to, msg.as_string())
-        return True, ""
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.sendmail(SMTP_FROM, to, msg.as_string())
+        return True
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def _send_email(to: str, subject: str, html: str, text: str = "") -> tuple:
-    if FORMSPREE_ID:
-        import re as _re
-        plain = _re.sub(r'<[^>]+>', ' ', html).strip()
-        plain = _re.sub(r'\s+', ' ', plain)
-        ok, err = _send_via_formspree(subject, plain)
-        if ok: return True, ""
-        print(f"[PPS] Formspree: {err}", file=sys.stderr)
-    return _send_via_smtp(to, subject, html)
+        print(f"[PPS] SMTP error: {e}")
+        return False
 
 def _gen_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits
@@ -1819,7 +1840,7 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
                 Paragraph(f'<font color="{dcol}"><b>{dpi:.1f} DPI</b></font>',
                           ps('di', fontSize=8)),
                 Paragraph(f'{img.get("width_px",img.get("width",0))}×{img.get("height_px",img.get("height",0))}px · '
-                          f'{img.get("colorspace","?")} · {dpi:.1f} DPI@1:1',
+                          f'{img.get("colorspace","?")} · {dpi:.1f} PPI@1:1',
                           ps('dn', fontSize=8, textColor=colors.HexColor('#9a9a94'))),
             ])
 
@@ -2123,11 +2144,11 @@ def smtp_test(admin_email: str, admin_password: str):
       An: {NOTIFY_EMAIL}<br><br>
       <small style="color:#9a9a94">PPS Admin &mdash; SMTP-Test</small>
     </div>"""
-    ok, err = _send_email(NOTIFY_EMAIL, "✓ PPS Test", html)
+    ok = _send_email(NOTIFY_EMAIL, "PPS SMTP Test", html)
     if ok:
-        return {"success": True, "message": f"✓ Gesendet an {NOTIFY_EMAIL}"}
+        return {"success": True, "message": f"Test-Mail an {NOTIFY_EMAIL} gesendet."}
     else:
-        raise HTTPException(500, f"Fehler: {err}")
+        raise HTTPException(500, "SMTP-Versand fehlgeschlagen. Bitte Variablen pruefen.")
 
 @app.post("/admin/users/{email}/upgrade")
 def upgrade_user(email: str, admin_email: str, admin_password: str):
@@ -2319,7 +2340,6 @@ def track_usage(req: dict):
         _track_usage(email, int(size_mb * 1024 * 1024))
         return {"success": True, "usage": _get_usage(email)}
     except Exception as e:
-        print(f"[PPS] /track error: {e}", file=sys.stderr)
         return {"success": False}
 
 @app.get("/usage")
@@ -2357,8 +2377,7 @@ def parse_offer(req: dict):
     pdf_text = req.get("pdf_text", "")[:8000]
     prompt = f"""Extrahiere aus diesem DCP Angebots-Text alle Informationen. Antworte NUR mit JSON ohne Backticks:
 {{"angebot_nr":"...","datum":"...","kd_nr":"...","kunde":"...","projekt":"...","objekt_bez":"...","ansprechpartner":"...","objekte":[{{"name":"...","breite_mm":1234,"hoehe_mm":5678,"menge":1}}],"gesamtbetrag":"...","lieferzeit":"..."}}
-Text:
-{pdf_text}"""
+Text:\n{pdf_text}"""
     payload = json.dumps({"model":"claude-sonnet-4-20250514","max_tokens":1000,
         "messages":[{"role":"user","content":prompt}]}).encode()
     try:
@@ -2371,7 +2390,7 @@ Text:
             raw = result["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
             return {"success": True, "data": json.loads(raw)}
     except Exception as e:
-        raise HTTPException(500, f"Fehler: {type(e).__name__}: {str(e)[:200]}")
+        raise HTTPException(500, f"Fehler: {str(e)[:200]}")
 
 @app.get("/health")
 def health():
