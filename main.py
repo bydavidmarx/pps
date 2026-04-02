@@ -1,6 +1,6 @@
 """
 PPS – Pre Production Service
-Backend API · Version 2.4.1
+Backend API · Version 2.4.3
 FastAPI + PyMuPDF · Developed for DCP
 """
 
@@ -64,6 +64,9 @@ async def analyze(
     scale: int = Form(10),
     job_name: Optional[str] = Form(""),
     user_email: Optional[str] = Form(""),
+    min_ppi: Optional[float] = Form(None),
+    crit_ppi: Optional[float] = Form(None),
+    app_type: Optional[str] = Form("textile"),
 ):
     import asyncio, gc
     if not file.filename.lower().endswith(".pdf"):
@@ -74,8 +77,8 @@ async def analyze(
         _check_and_increment_trial(user_email.strip().lower())
 
     data = await file.read()
-    if len(data) > 100 * 1024 * 1024:
-        raise HTTPException(413, "Datei zu groß (max. 100 MB).")
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "Datei zu groß (max. 200 MB).")
 
     if user_email:
         _track_usage(user_email.strip().lower(), len(data))
@@ -126,8 +129,8 @@ async def fix_pdf(
 ):
     import gc, asyncio
     data = await file.read()
-    if len(data) > 100 * 1024 * 1024:
-        raise HTTPException(413, "Datei zu groß (max. 100 MB).")
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "Datei zu groß (max. 200 MB).")
 
     if user_email:
         _track_usage(user_email.strip().lower(), len(data))
@@ -216,7 +219,7 @@ async def fix_pdf(
                 bad = [i for i in imgs if i.get("dpi_at_1to1", 0) < 25]
                 if bad:
                     fixes_applied.append(
-                        f"Hinweis: {len(bad)} Bild(er) unter 25 PPI wurden hochgerechnet "
+                        f"Hinweis: {len(bad)} Bild(er) unter 25 DPI wurden hochgerechnet "
                         f"— Druckqualitaet koennte beeintraechtigt sein"
                     )
 
@@ -276,7 +279,7 @@ async def fix_pdf(
 # ─────────────────────────────────────────────
 #  CORE ANALYSIS LOGIC
 # ─────────────────────────────────────────────
-def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
+def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename, min_ppi_override=None, crit_ppi_override=None):
     page = doc[0]
     page_count = len(doc)
 
@@ -416,8 +419,9 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
     })
 
     # 5. Image resolution
-    min_dpi_doc = 50.0 / scale
-    critical_dpi = 25.0 / scale
+    # PPI-Schwellwerte: Standard 50/25 PPI bei 1:1, überschreibbar je nach Anwendungstyp
+    min_dpi_doc  = (min_ppi_override  if min_ppi_override  else 50.0) / scale
+    critical_dpi = (crit_ppi_override if crit_ppi_override else 25.0) / scale
     img_status, img_value, img_note = evaluate_images(images, min_dpi_doc, critical_dpi, scale)
     checks.append({
         "id": "resolution",
@@ -621,27 +625,27 @@ def evaluate_images(images, min_dpi, critical_dpi, scale):
     min_in_doc  = min(i["dpi_in_doc"]  for i in valid)
     max_in_doc  = max(i["dpi_in_doc"]  for i in valid)
 
-    min_print = 50.0   # Minimum PPI bei 1:1
+    min_print = 50.0   # Minimum DPI bei 1:1
     crit_print = 25.0  # Kritisch — zu niedrig für Upscaling
 
     below_min  = [i for i in valid if i["dpi_at_1to1"] < min_print]
     below_crit = [i for i in valid if i["dpi_at_1to1"] < crit_print]
 
     value = (f"{len(images)} Bild(er) · "
-             f"{min_in_doc:.0f}–{max_in_doc:.0f} PPI im Dokument "
-             f"(= {min_at_1to1:.0f}–{max_at_1to1:.0f} PPI bei 1:1)")
+             f"{min_in_doc:.0f}–{max_in_doc:.0f} DPI im Dokument "
+             f"(= {min_at_1to1:.0f}–{max_at_1to1:.0f} DPI bei 1:1)")
 
     if below_crit:
         return ("error", value,
-                f"{len(below_crit)} Bild(er) unter {crit_print:.0f} PPI (1:1). "
+                f"{len(below_crit)} Bild(er) unter {crit_print:.0f} DPI (1:1). "
                 f"Zu niedrig für Upscaling — bitte Originaldatei in höherer Auflösung liefern.")
     elif below_min:
         return ("warn", value,
-                f"{len(below_min)} Bild(er) unter {min_print:.0f} PPI (1:1). "
+                f"{len(below_min)} Bild(er) unter {min_print:.0f} DPI (1:1). "
                 f"Upscaling (2×) über 'Fix It' möglich.")
     else:
         return ("ok", value,
-                f"Alle Bilder erreichen mindestens {min_print:.0f} PPI bei 1:1. Auflösung ausreichend.")
+                f"Alle Bilder erreichen mindestens {min_print:.0f} DPI bei 1:1. Auflösung ausreichend.")
 
 
 # ─────────────────────────────────────────────
@@ -716,76 +720,30 @@ def analyze_colorspace(page, doc, raw_bytes):
         is_mixed = True
         is_cmyk = False
 
-    # ── ICC: direkt aus PDF-Streams lesen ──
-    def _read_icc_desc(b):
-        try:
-            if len(b) < 132: return ""
-            tc = struct.unpack_from(">I", b, 128)[0]
-            if tc > 200: return ""
-            for i in range(tc):
-                base = 132 + i*12
-                if base+12 > len(b): break
-                sig = b[base:base+4]
-                off = struct.unpack_from(">I", b, base+4)[0]
-                sz  = struct.unpack_from(">I", b, base+8)[0]
-                if sig == b"desc":
-                    d = b[off:off+sz]
-                    if d[:4] == b"desc" and len(d) >= 12:
-                        ln = struct.unpack_from(">I", d, 8)[0]
-                        return d[12:12+ln].rstrip(b"\x00").decode("ascii","replace").strip()
-                    elif d[:4] == b"mluc" and len(d) >= 24:
-                        sl = struct.unpack_from(">I", d, 16)[0]
-                        so = struct.unpack_from(">I", d, 20)[0]
-                        if so+sl <= len(d):
-                            return d[so:so+sl].decode("utf-16-be","replace").rstrip("\x00").strip()
-        except Exception:
-            pass
-        return ""
+    # ICC profile extraction from raw PDF bytes
+    icc_markers = [b"/ICCBased", b"ICCProfile", b"icc", b"ICC"]
+    raw_lower = raw_bytes.lower()
 
-    def _normalize_icc(raw):
-        nl = raw.lower()
-        if "iso coated v2" in nl or "isocoated_v2" in nl: return "ISO Coated v2 (ECI)", True
-        if "fogra39" in nl: return "ISO Coated v2 / Fogra39", True
-        if "fogra51" in nl: return "ISO Uncoated v2 / Fogra51", False
-        if "srgb" in nl or "iec61966" in nl: return "sRGB IEC61966", False
-        if "adobe rgb" in nl: return "Adobe RGB (1998)", False
-        if "display p3" in nl: return "Display P3", False
-        return raw, False
-
-    try:
-        for xref in range(1, doc.xref_length()):
-            try:
-                if not doc.xref_is_stream(xref): continue
-                obj_str = doc.xref_object(xref, compressed=False)
-                if "/N " not in obj_str and "/N\n" not in obj_str: continue
-                if any(k in obj_str for k in ["/Subtype","/Width","/Height","/BitsPerComponent"]): continue
-                icc_bytes = doc.xref_stream(xref)
-                if icc_bytes and len(icc_bytes) >= 40 and icc_bytes[36:40] == b"acsp":
-                    desc = _read_icc_desc(icc_bytes)
-                    if desc:
-                        icc_name, icc_ok = _normalize_icc(desc)
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
+    known_profiles = {
+        b"iso coated v2": "ISO Coated v2 (ECI)",
+        b"isocoated_v2": "ISO Coated v2 (ECI)",
+        b"fogra39": "ISO Coated v2 / Fogra39",
+        b"fogra51": "ISO Uncoated v2 / Fogra51",
+        b"srgb": "sRGB IEC61966",
+        b"adobe rgb": "Adobe RGB (1998)",
+        b"p3": "Display P3",
+    }
+    for marker, name in known_profiles.items():
+        if marker in raw_lower:
+            icc_name = name
+            icc_ok = "iso coated v2" in name.lower() or "fogra39" in name.lower()
+            break
 
     if not icc_name:
-        rl = raw_bytes.lower()
-        for marker, name, ok in [
-            (b"iso coated v2",    "ISO Coated v2 (ECI)",       True),
-            (b"isocoated_v2",     "ISO Coated v2 (ECI)",       True),
-            (b"fogra39",          "ISO Coated v2 / Fogra39",   True),
-            (b"fogra51",          "ISO Uncoated v2 / Fogra51", False),
-            (b"display p3",       "Display P3",                False),
-            (b"srgb iec61966",    "sRGB IEC61966",             False),
-            (b"adobe rgb",        "Adobe RGB (1998)",           False),
-        ]:
-            if marker in rl:
-                icc_name, icc_ok = name, ok
-                break
-    if not icc_name and (b"/iccbased" in raw_bytes.lower()):
-        icc_name = "ICC-Profil gefunden (Name nicht lesbar)"
+        # Try to find any ICC keyword
+        if b"/iccbased" in raw_lower or b"iccprofile" in raw_lower:
+            icc_name = "ICC-Profil gefunden (Name nicht lesbar)"
+            icc_ok = False
 
     cs_parts = []
     if is_cmyk: cs_parts.append("CMYK")
@@ -946,7 +904,7 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             if dpi_1to1 >= min_dpi_1to1:
                 continue  # bereits gut genug — kein Upscaling nötig
 
-            # Alle unter 50 PPI werden hochgerechnet (auch unter 25 PPI)
+            # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
             # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
             target_dpi = 100.0
             factor = min(target_dpi / dpi_1to1, 4.0)  # max 4x upscale
@@ -1034,7 +992,7 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                         upscaled_count += 1
                         new_dpi = item["dpi_1to1"] * item["factor"]
                         print(f"[PPS] REPLACED '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
-                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} PPI@1:1", file=sys.stderr)
+                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} DPI@1:1", file=sys.stderr)
                         break
                 except Exception as xe:
                     print(f"[PPS] xobj error {name}: {xe}", file=sys.stderr)
@@ -1215,10 +1173,10 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         import io as _io
         import gc as _gc
 
-        # Renderauflösung: Ziel 50 PPI bei 1:1-Druckgröße → im Dokument 50×scale DPI
+        # Renderauflösung: Ziel 50 DPI bei 1:1-Druckgröße → im Dokument 50×scale DPI
         # Begrenzt auf 600 DPI als RAM-Schutz
         dpi = max(min(int(50 * scale), 600), 100)
-        print(f"[PPS] bleed render: {dpi} DPI (scale={scale}, {dpi//scale} PPI@1:1)", file=__import__('sys').stderr)
+        print(f"[PPS] bleed render: {dpi} DPI (scale={scale}, {dpi//scale} DPI@1:1)", file=__import__('sys').stderr)
         sf = dpi / 72.0
 
         def render_strip(x0, y0, x1, y1):
@@ -1840,7 +1798,7 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
                 Paragraph(f'<font color="{dcol}"><b>{dpi:.1f} DPI</b></font>',
                           ps('di', fontSize=8)),
                 Paragraph(f'{img.get("width_px",img.get("width",0))}×{img.get("height_px",img.get("height",0))}px · '
-                          f'{img.get("colorspace","?")} · {dpi:.1f} PPI@1:1',
+                          f'{img.get("colorspace","?")} · {dpi:.1f} DPI@1:1',
                           ps('dn', fontSize=8, textColor=colors.HexColor('#9a9a94'))),
             ])
 
@@ -2253,39 +2211,38 @@ class IssueReport(BaseModel):
 
 @app.post("/report-issue")
 def report_issue(req: IssueReport):
-    """Empfaengt Fehlerberichte von Nutzern — schickt E-Mail mit Screenshot."""
+    """Empfaengt Fehlerberichte von Nutzern und schickt sie per E-Mail."""
     try:
-        has_screenshot = bool(req.screenshot and req.screenshot.startswith("data:image"))
         screenshot_html = ""
-        if has_screenshot:
-            screenshot_html = f'<div style="margin-top:1rem"><div style="font-size:10px;color:#9a9a94;margin-bottom:.5rem;font-family:monospace;text-transform:uppercase;letter-spacing:.1em">Screenshot</div><img src="{req.screenshot}" style="width:100%;border:1px solid #d0cdc4;border-radius:3px" alt="Screenshot"></div>'
+        if req.screenshot and req.screenshot.startswith("data:image"):
+            screenshot_html = f'''
+            <div style="margin-top:1rem">
+              <div style="font-size:10px;color:#9a9a94;margin-bottom:.5rem;font-family:monospace;text-transform:uppercase;letter-spacing:.1em">Screenshot</div>
+              <img src="{req.screenshot}" style="width:100%;border:1px solid #d0cdc4;border-radius:3px" alt="Screenshot">
+            </div>'''
 
-        html = f"""<div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
+        html = f"""
+        <div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
           <div style="background:#f5f3ee;border-left:3px solid #c0392b;padding:1rem;margin-bottom:1.5rem">
-            <strong style="color:#c0392b">&#9888; PPS Fehlerbericht</strong>
+            <strong style="color:#c0392b">&#9888; Neuer Fehlerbericht</strong>
           </div>
           <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:1rem">
             <tr><td style="color:#9a9a94;padding:4px 8px;width:120px">Nutzer</td><td style="padding:4px 8px"><b>{req.user}</b></td></tr>
             <tr><td style="color:#9a9a94;padding:4px 8px">Seite</td><td style="padding:4px 8px">{req.page}</td></tr>
             <tr><td style="color:#9a9a94;padding:4px 8px">Zeitpunkt</td><td style="padding:4px 8px">{req.timestamp}</td></tr>
           </table>
-          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">{req.message}</div>
+          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">
+            {req.message}
+          </div>
           {screenshot_html}
-          <div style="margin-top:1.5rem;font-size:10px;color:#9a9a94">PPS XPRESS &mdash; {req.backend or ''}</div>
+          <div style="margin-top:1.5rem;font-size:10px;color:#9a9a94">PPS XPRESS &mdash; Automatischer Fehlerbericht</div>
         </div>"""
 
-        ok, err = _send_email(
+        _send_email(
             NOTIFY_EMAIL,
-            f"\u26a0\ufe0f PPS Fehlerbericht: {req.user} \u2014 {req.message[:60]}",
+            f"PPS Fehlerbericht: {req.user} &mdash; {req.message[:60]}",
             html
         )
-        if not ok:
-            print(f"[PPS] report-issue SMTP error: {err}", file=sys.stderr)
-            # Formspree fallback (kein Screenshot, aber Nachricht kommt an)
-            _send_via_formspree(
-                f"PPS Fehlerbericht: {req.user}",
-                f"Von: {req.user}\nZeit: {req.timestamp}\nSeite: {req.page}\n\n{req.message}\n\nScreenshot: {'Ja (nur per SMTP verfügbar)' if has_screenshot else 'Nein'}"
-            )
         return {"success": True}
     except Exception as e:
         print(f"[PPS] report-issue error: {e}", file=sys.stderr)
