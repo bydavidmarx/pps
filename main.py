@@ -311,7 +311,7 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
     else:
         excess_w = trim_w_mm - expected_w_mm
         excess_h = trim_h_mm - expected_h_mm
-        tol = expected_bleed_mm * 0.30
+        tol = expected_bleed_mm * 0.50  # 50% Toleranz - fängt auch leicht abweichende Werte
         if (excess_w > expected_bleed_mm * 1.2 and
             abs((excess_w/2) - expected_bleed_mm) < tol and
             abs((excess_h/2) - expected_bleed_mm) < tol):
@@ -378,7 +378,8 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
         "status": "ok" if ratio_ok else "error",
         "value": f"PDF (Netto): {trim_w_mm:.1f} × {trim_h_mm:.1f} mm · Erwartet: {expected_w_mm:.1f} × {expected_h_mm:.1f} mm",
         "note": f"Verhältnis stimmt überein (1:{scale})." if ratio_ok
-                else f"Abweichung: Breite {ratio_diff_w:+.1f} mm, Höhe {ratio_diff_h:+.1f} mm. Bitte Datei prüfen.",
+                else (f"Beschnitt ist in der Seitengröße eingerechnet — das ist bekannt. Netto-Format stimmt mit dem Druckmaß überein." if bleed_in_page and ratio_diff_w < 1 and ratio_diff_h < 1
+                      else f"Abweichung: Breite {ratio_diff_w:+.1f} mm, Höhe {ratio_diff_h:+.1f} mm. Bitte Datei prüfen."),
         "fixable": False,
         "details": {"trim_w": round(trim_w_mm, 1), "trim_h": round(trim_h_mm, 1),
                     "expected_w": round(expected_w_mm, 1), "expected_h": round(expected_h_mm, 1)}
@@ -2204,120 +2205,45 @@ class IssueReport(BaseModel):
     timestamp: str
     screenshot: Optional[str] = None
     backend: Optional[str] = None
-    store_in_dashboard: Optional[bool] = False
-
-def _get_all_reports() -> list:
-    try:
-        raw = _upstash_get("pps_reports")
-        return json.loads(raw) if raw else []
-    except Exception:
-        return []
-
-def _save_reports(reports: list):
-    try:
-        _upstash_set("pps_reports", json.dumps(reports))
-    except Exception as e:
-        print(f"[PPS] save_reports error: {e}", file=sys.stderr)
 
 @app.post("/report-issue")
 def report_issue(req: IssueReport):
-    """Speichert Fehlerberichte im Dashboard und schickt E-Mail-Benachrichtigung."""
+    """Empfaengt Fehlerberichte von Nutzern und schickt sie per E-Mail."""
     try:
-        import uuid, datetime as _dt
-        report_id = str(uuid.uuid4())[:8]
+        screenshot_html = ""
+        if req.screenshot and req.screenshot.startswith("data:image"):
+            screenshot_html = f'''
+            <div style="margin-top:1rem">
+              <div style="font-size:10px;color:#9a9a94;margin-bottom:.5rem;font-family:monospace;text-transform:uppercase;letter-spacing:.1em">Screenshot</div>
+              <img src="{req.screenshot}" style="width:100%;border:1px solid #d0cdc4;border-radius:3px" alt="Screenshot">
+            </div>'''
 
-        # ── 1. Im Dashboard speichern (Upstash) ──
-        reports = _get_all_reports()
-        new_report = {
-            "id": report_id,
-            "user": req.user,
-            "page": req.page,
-            "message": req.message,
-            "timestamp": req.timestamp,
-            "screenshot": req.screenshot if req.screenshot else None,
-            "backend": req.backend or "",
-            "status": "open",
-            "created_at": _dt.datetime.utcnow().isoformat()
-        }
-        reports.insert(0, new_report)
-        reports = reports[:100]  # Max 100 Berichte
-        _save_reports(reports)
-
-        # ── 2. E-Mail-Benachrichtigung (ohne Screenshot) ──
-        html = f"""<div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
+        html = f"""
+        <div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
           <div style="background:#f5f3ee;border-left:3px solid #c0392b;padding:1rem;margin-bottom:1.5rem">
-            <strong style="color:#c0392b">&#9888; Neuer Fehlerbericht #{report_id}</strong>
+            <strong style="color:#c0392b">&#9888; Neuer Fehlerbericht</strong>
           </div>
           <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:1rem">
             <tr><td style="color:#9a9a94;padding:4px 8px;width:120px">Nutzer</td><td style="padding:4px 8px"><b>{req.user}</b></td></tr>
             <tr><td style="color:#9a9a94;padding:4px 8px">Seite</td><td style="padding:4px 8px">{req.page}</td></tr>
             <tr><td style="color:#9a9a94;padding:4px 8px">Zeitpunkt</td><td style="padding:4px 8px">{req.timestamp}</td></tr>
-            <tr><td style="color:#9a9a94;padding:4px 8px">Screenshot</td><td style="padding:4px 8px">{'Ja' if req.screenshot else 'Nein'}</td></tr>
           </table>
-          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">{req.message}</div>
-          <div style="margin-top:1rem;font-size:10px;color:#9a9a94">Screenshot und Details im Admin-Dashboard unter /pps/pps-admin.html</div>
+          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">
+            {req.message}
+          </div>
+          {screenshot_html}
+          <div style="margin-top:1.5rem;font-size:10px;color:#9a9a94">PPS XPRESS &mdash; Automatischer Fehlerbericht</div>
         </div>"""
 
         _send_email(
             NOTIFY_EMAIL,
-            f"\u26a0\ufe0f PPS Fehlerbericht von {req.user}: {req.message[:50]}",
+            f"PPS Fehlerbericht: {req.user} &mdash; {req.message[:60]}",
             html
         )
-        return {"success": True, "id": report_id}
+        return {"success": True}
     except Exception as e:
         print(f"[PPS] report-issue error: {e}", file=sys.stderr)
         return {"success": False}
-
-@app.get("/admin/reports")
-def get_reports(admin_email: str, admin_password: str):
-    """Gibt alle gespeicherten Fehlerberichte zurueck."""
-    if not _is_admin(admin_email, admin_password):
-        raise HTTPException(403, "Nicht autorisiert.")
-    reports = _get_all_reports()
-    # Screenshot nicht mitsenden für Liste (zu groß) — nur bei Einzelabruf
-    # Return screenshot as placeholder for list view
-    result = []
-    for r in reports:
-        entry = dict(r)
-        if entry.get("screenshot") and len(entry["screenshot"]) > 200:
-            entry["screenshot"] = entry["screenshot"]  # keep full for admin
-        result.append(entry)
-    reports = result
-    return {"reports": reports, "count": len(reports)}
-
-@app.get("/admin/reports/{report_id}")
-def get_report_detail(report_id: str, admin_email: str, admin_password: str):
-    """Gibt einen einzelnen Bericht mit Screenshot zurueck."""
-    if not _is_admin(admin_email, admin_password):
-        raise HTTPException(403, "Nicht autorisiert.")
-    reports = _get_all_reports()
-    for r in reports:
-        if r.get("id") == report_id:
-            return r
-    raise HTTPException(404, "Bericht nicht gefunden.")
-
-@app.post("/admin/reports/{report_id}/status")
-def update_report_status(report_id: str, req: dict, admin_email: str, admin_password: str):
-    """Setzt den Status eines Berichts (open/resolved)."""
-    if not _is_admin(admin_email, admin_password):
-        raise HTTPException(403, "Nicht autorisiert.")
-    reports = _get_all_reports()
-    for r in reports:
-        if r.get("id") == report_id:
-            r["status"] = req.get("status", "open")
-            _save_reports(reports)
-            return {"success": True}
-    raise HTTPException(404, "Bericht nicht gefunden.")
-
-@app.delete("/admin/reports/{report_id}")
-def delete_report(report_id: str, admin_email: str, admin_password: str):
-    """Loescht einen Fehlerbericht."""
-    if not _is_admin(admin_email, admin_password):
-        raise HTTPException(403, "Nicht autorisiert.")
-    reports = _get_all_reports()
-    reports = [r for r in reports if r.get("id") != report_id]
-    _save_reports(reports)
-    return {"success": True}
 
 # ─────────────────────────────────────────────
 #  HEALTH CHECK
