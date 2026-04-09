@@ -1151,9 +1151,30 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
             return pdf_bytes, fixes_applied
 
         if trimbox and trimbox != mediabox:
+            # TrimBox vorhanden → sauber definierter Druckbereich
             clip_rect = trimbox
         else:
-            clip_rect = _estimate_trim_area(page, mediabox)
+            # Keine TrimBox → nur wenn tatsächlich Schnittmarken erkannt wurden
+            # _estimate_trim_area aufrufen, sonst direkt Mediabox verwenden.
+            # WICHTIG: Nie _estimate_trim_area blind aufrufen — es kann
+            # fälschlicherweise dünne Vektorlinien im Bildinhalt als
+            # Schnittmarken interpretieren und eine zu kleine clip_rect liefern.
+            actual_cropmarks = detect_cropmarks(page, media_w_pt * PT_TO_MM,
+                                                media_h_pt * PT_TO_MM,
+                                                media_w_pt * PT_TO_MM,
+                                                media_h_pt * PT_TO_MM)
+            if actual_cropmarks:
+                clip_rect = _estimate_trim_area(page, mediabox)
+                # Sicherheitsprüfung: clip_rect darf nicht zu klein sein
+                if (clip_rect.width < mediabox.width * 0.7 or
+                        clip_rect.height < mediabox.height * 0.7):
+                    print(f"[PPS] _estimate_trim_area result too small "
+                          f"({clip_rect.width*PT_TO_MM:.1f}mm) — using mediabox",
+                          file=__import__('sys').stderr)
+                    clip_rect = mediabox
+            else:
+                # Keine Schnittmarken → Mediabox ist der Druckbereich
+                clip_rect = mediabox
 
         W = clip_rect.width
         H = clip_rect.height
