@@ -1279,21 +1279,27 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         )
         canvas_buf = None
 
-        # ── TrimBox setzen ──
-        # MediaBox = volle Seite inkl. Beschnitt (new_w × new_h)
-        # TrimBox  = Netto-Motiv ohne Beschnitt (B Punkte Rand auf allen Seiten)
-        # Ohne TrimBox würde PPS beim nächsten Check melden:
-        # "Seite ist X mm, aber Beschnitt fehlt" — weil keine TrimBox vorhanden
-        trim_rect = fitz.Rect(B, B, new_w - B, new_h - B)
+        # ── TrimBox setzen — IMMER auf Basis der Soll-Maße ──
+        trimbox_w = new_w - 2 * B
+        if abs(trimbox_w - expected_w_pt) > expected_w_pt * 0.02:
+            import sys as _sys
+            print(f"[PPS] TrimBox-Korrektur: {trimbox_w*PT_TO_MM:.1f}mm → {expected_w_mm:.1f}mm",
+                  file=_sys.stderr)
+            trim_rect = fitz.Rect(B, B, expected_w_pt + B, expected_h_pt + B)
+        else:
+            trim_rect = fitz.Rect(B, B, new_w - B, new_h - B)
         new_page.set_trimbox(trim_rect)
-        print(f"[PPS] TrimBox: {trim_rect} | Beschnitt: {B:.1f}pt = {B*PT_TO_MM:.1f}mm", file=__import__('sys').stderr)
+        print(f"[PPS] TrimBox: {trim_rect} | Beschnitt: {B:.1f}pt = {B*PT_TO_MM:.1f}mm",
+              file=__import__('sys').stderr)
 
         pdf_bytes = new_doc.tobytes(garbage=4, deflate=True)
         new_doc.close()
         _gc.collect()
 
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
-        fixes_applied.append(f"TrimBox gesetzt: Nettogröße {round(expected_w_mm,1)} × {round(expected_h_mm,1)} mm")
+        trim_w_out = round((trim_rect.x1 - trim_rect.x0) * PT_TO_MM, 1)
+        trim_h_out = round((trim_rect.y1 - trim_rect.y0) * PT_TO_MM, 1)
+        fixes_applied.append(f"TrimBox gesetzt: Nettogröße {trim_w_out} × {trim_h_out} mm")
         return pdf_bytes, fixes_applied
 
     pdf_bytes = doc.tobytes(garbage=4, deflate=True)
