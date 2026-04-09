@@ -375,7 +375,7 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
     checks.append({
         "id": "ratio",
         "label": "Seitenverhältnis",
-        "status": "ok" if ratio_ok else "error",
+        "status": "ok" if (ratio_ok or bleed_in_page) else "error",
         "value": f"PDF (Netto): {trim_w_mm:.1f} × {trim_h_mm:.1f} mm · Erwartet: {expected_w_mm:.1f} × {expected_h_mm:.1f} mm",
         "note": f"Verhältnis stimmt überein (1:{scale})." if ratio_ok
                 else (f"Beschnitt ist in der Seitengröße eingerechnet — das ist bekannt. Netto-Format stimmt mit dem Druckmaß überein." if bleed_in_page and ratio_diff_w < 1 and ratio_diff_h < 1
@@ -1176,16 +1176,27 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
                 # Keine Schnittmarken → Mediabox ist der Druckbereich
                 clip_rect = mediabox
 
-        W = clip_rect.width
-        H = clip_rect.height
+        # ── WICHTIG: Größe des Ausgabe-PDFs immer aus den SOLL-Maßen berechnen ──
+        # clip_rect wird NUR für das Rendering (welcher Bereich wird gerendert) verwendet.
+        # new_w/new_h und TrimBox basieren immer auf den bekannten Druckmaßen.
+        # Das verhindert falsche Seitengrößen durch PDF-Koordinaten-Quirks.
+        W = expected_w_pt   # = print_w/scale in Punkten — IMMER korrekt
+        H = expected_h_pt   # = print_h/scale in Punkten — IMMER korrekt
         B = expected_bleed_pt
 
-        # Koordinaten normalisieren: clip_rect kann bei x0>0,y0>0 beginnen
-        # Für Randstreifen brauchen wir absolute Koordinaten auf der Originalseite
+        # Render-Koordinaten: welcher Bereich wird abgetastet?
+        # clip_rect bestimmt die Quelle, W/H bestimmen das Ziel.
         cx0 = clip_rect.x0
         cy0 = clip_rect.y0
         cx1 = clip_rect.x1
         cy1 = clip_rect.y1
+
+        # Debug-Ausgabe: Abweichung zwischen clip_rect und Soll-Maß
+        if abs(clip_rect.width - expected_w_pt) > 10:  # > ~3.5mm Abweichung
+            import sys
+            print(f"[PPS] clip_rect.width={clip_rect.width*25.4/72:.1f}mm ≠ "
+                  f"expected={expected_w_pt*25.4/72:.1f}mm — using expected for page size",
+                  file=sys.stderr)
 
         from PIL import Image
         import io as _io
@@ -1282,7 +1293,7 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         _gc.collect()
 
         fixes_applied.append(f"Beschnittzugabe {expected_bleed_mm:.1f} mm durch Randspiegelung hinzugefügt")
-        fixes_applied.append(f"TrimBox gesetzt: Nettogröße {round(W*PT_TO_MM,1)} × {round(H*PT_TO_MM,1)} mm")
+        fixes_applied.append(f"TrimBox gesetzt: Nettogröße {round(expected_w_mm,1)} × {round(expected_h_mm,1)} mm")
         return pdf_bytes, fixes_applied
 
     pdf_bytes = doc.tobytes(garbage=4, deflate=True)
