@@ -929,8 +929,18 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
 
             # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
             # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
-            target_dpi = 100.0
-            factor = min(target_dpi / dpi_1to1, 4.0)  # max 4x upscale
+            # Ziel: gerade über die 50 PPI-Schwelle (nicht pauschal 100 PPI)
+            # Beispiel: Bild bei 40 PPI → Faktor 50/40 = 1.25x, nicht 2.5x
+            target_dpi = min_dpi_1to1 * 1.05   # 5% über der Schwelle = sicher drüber
+            factor = target_dpi / dpi_1to1       # z.B. 52.5/40 = 1.31x
+            factor = min(factor, 2.0)            # max 2x als Sicherheitsgrenze
+            factor = max(factor, 1.0)            # nie verkleinern
+
+            print(f"[PPS] upscale {dpi_1to1:.0f}→{dpi_1to1*factor:.0f} PPI@1:1 "
+                  f"(factor={factor:.2f}, {img_w_px}x{img_h_px}→"
+                  f"{int(img_w_px*factor)}x{int(img_h_px*factor)}px)",
+                  file=__import__('sys').stderr)
+
             to_upscale.append({
                 "xref": xref,
                 "rect": r,
