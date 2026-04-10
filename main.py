@@ -200,10 +200,15 @@ async def fix_pdf(
         _notify_error(f"Fix-Timeout: {file.filename}")
         raise HTTPException(504, "Fix-Timeout (>180s). Datei ist moeglicherweise zu komplex.")
     except Exception as e:
-        doc.close()
-        del data
-        _notify_error(f"Fix-Fehler: {file.filename} — {e}")
-        raise HTTPException(500, f"Fix fehlgeschlagen: {str(e)[:200]}")
+        import traceback as _tb
+        _tb.print_exc(file=sys.stderr)
+        print(f"[PPS] Fix-Fehler: {type(e).__name__}: {e}", file=sys.stderr)
+        try: doc.close()
+        except: pass
+        try: del data
+        except: pass
+        _notify_error(f"Fix-Fehler: {file.filename} — {type(e).__name__}: {e}")
+        raise HTTPException(500, f"Fix fehlgeschlagen: {type(e).__name__}: {str(e)[:300]}")
     doc.close()
     del data  # Original-Bytes nicht mehr nötig
     gc.collect()
@@ -261,18 +266,24 @@ async def fix_pdf(
             zf.writestr(fixed_name, fixed_pdf)
             zf.writestr(base_name + "_PPS_Report.pdf", report_bytes)
         zip_buf.seek(0)
+        # HTTP-Header dürfen nur Latin-1 — Dateinamen mit Umlauten sanitieren
+        def _safe_filename(name):
+            return name.encode("ascii", "replace").decode("ascii").replace("?", "_")
+        def _safe_header(text):
+            return text.encode("latin-1", "replace").decode("latin-1")
+
         return Response(
             content=zip_buf.getvalue(),
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{base_name}_PPS.zip"',
-                     "X-Fixes-Applied": ", ".join(fixes_applied).encode("ascii","ignore").decode()}
+            headers={"Content-Disposition": f'attachment; filename="{_safe_filename(base_name)}_PPS.zip"',
+                     "X-Fixes-Applied": _safe_header(", ".join(fixes_applied))}
         )
     else:
         return Response(
             content=fixed_pdf,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{fixed_name}"',
-                     "X-Fixes-Applied": ", ".join(fixes_applied).encode("ascii","ignore").decode()}
+            headers={"Content-Disposition": f'attachment; filename="{_safe_filename(fixed_name)}"',
+                     "X-Fixes-Applied": _safe_header(", ".join(fixes_applied))}
         )
 
 
