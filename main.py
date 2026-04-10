@@ -1241,10 +1241,12 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         import io as _io
         import gc as _gc
 
-        # Renderauflösung: Ziel 50 DPI bei 1:1-Druckgröße → im Dokument 50×scale DPI
-        # Begrenzt auf 600 DPI als RAM-Schutz
-        dpi = max(min(int(50 * scale), 600), 100)
-        print(f"[PPS] bleed render: {dpi} DPI (scale={scale}, {dpi//scale} DPI@1:1)", file=__import__('sys').stderr)
+        # Renderauflösung für Randspiegelung: max 150 DPI — Bleed-Streifen
+        # brauchen keine hohe Auflösung. Bei 500 DPI (scale=10) würde das
+        # Canvas allein 840 MB RAM brauchen → OOM/502 auf Railway.
+        # 150 DPI ergibt ~30 MB — optisch identisch für Randspiegelung.
+        dpi = max(min(int(50 * scale), 150), 72)
+        print(f"[PPS] bleed render: {dpi} DPI (scale={scale}, RAM-safe cap 150)", file=__import__('sys').stderr)
         sf = dpi / 72.0
 
         def render_strip(x0, y0, x1, y1):
