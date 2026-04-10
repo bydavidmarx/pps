@@ -287,7 +287,19 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
 
     # ── Box-Analyse ──
     mediabox = page.mediabox
-    trimbox  = page.trimbox if page.trimbox != page.mediabox else None
+    # TrimBox zuverlässig ermitteln: sowohl PyMuPDF-Vergleich als auch Raw-Dict
+    _tb = page.trimbox
+    _mb = page.mediabox
+    # Prüfe auch im rohen PDF-Objekt ob /TrimBox gesetzt ist
+    try:
+        _raw = doc.xref_object(page.xref)
+        _has_trimbox_in_dict = '/TrimBox' in _raw
+    except Exception:
+        _has_trimbox_in_dict = False
+    if _tb != _mb or (_has_trimbox_in_dict and abs(_tb.width - _mb.width) > 0.5):
+        trimbox = _tb
+    else:
+        trimbox = None
 
     media_w_mm = (mediabox.x1 - mediabox.x0) * PT_TO_MM
     media_h_mm = (mediabox.y1 - mediabox.y0) * PT_TO_MM
@@ -1132,8 +1144,7 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
             abs(excess_w_pt/2 - expected_bleed_pt) < tol_pt and
             abs(excess_h_pt/2 - expected_bleed_pt) < tol_pt
         )
-        if not bleed_in_page and not has_trimbox and excess_w_pt > expected_bleed_pt * 1.5:
-            bleed_in_page = True
+        # Kein loses Fallback — nur bei präziser Übereinstimmung des excess mit erwartetem Bleed
 
         if bleed_in_page:
             actual_bleed_w = excess_w_pt / 2
