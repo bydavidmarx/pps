@@ -214,7 +214,7 @@ async def fix_pdf(
     gc.collect()
 
     if upscaled_count > 0:
-        fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf 100 DPI")
+        fixes_applied.append(f"{upscaled_count} Pixel-Bild(er) hochgerechnet auf ~52 PPI")
 
     # Warnung für nicht-fixbare Bilder
     if analysis_result:
@@ -224,7 +224,7 @@ async def fix_pdf(
                 bad = [i for i in imgs if i.get("dpi_at_1to1", 0) < 25]
                 if bad:
                     fixes_applied.append(
-                        f"Hinweis: {len(bad)} Bild(er) unter 25 DPI wurden hochgerechnet "
+                        f"Hinweis: {len(bad)} Bild(er) unter 25 PPI wurden hochgerechnet "
                         f"— Druckqualitaet koennte beeintraechtigt sein"
                     )
 
@@ -640,7 +640,7 @@ def evaluate_images(images, min_dpi, critical_dpi, scale):
 
     valid = [i for i in images if "dpi_in_doc" in i and i["dpi_in_doc"] > 0]
     if not valid:
-        return ("warn", f"{len(images)} Bild(er) — DPI nicht messbar", "Auflösung konnte nicht bestimmt werden.")
+        return ("warn", f"{len(images)} Bild(er) — PPI nicht messbar", "Auflösung konnte nicht bestimmt werden.")
 
     # dpi_at_1to1 ist die echte Druckauflösung (dpi_in_doc / scale)
     min_at_1to1 = min(i["dpi_at_1to1"] for i in valid)
@@ -648,27 +648,27 @@ def evaluate_images(images, min_dpi, critical_dpi, scale):
     min_in_doc  = min(i["dpi_in_doc"]  for i in valid)
     max_in_doc  = max(i["dpi_in_doc"]  for i in valid)
 
-    min_print = 50.0   # Minimum DPI bei 1:1
+    min_print = 50.0   # Minimum PPI bei 1:1
     crit_print = 25.0  # Kritisch — zu niedrig für Upscaling
 
     below_min  = [i for i in valid if i["dpi_at_1to1"] < min_print]
     below_crit = [i for i in valid if i["dpi_at_1to1"] < crit_print]
 
     value = (f"{len(images)} Bild(er) · "
-             f"{min_in_doc:.0f}–{max_in_doc:.0f} DPI im Dokument "
-             f"(= {min_at_1to1:.0f}–{max_at_1to1:.0f} DPI bei 1:1)")
+             f"{min_in_doc:.0f}–{max_in_doc:.0f} PPI im Dokument "
+             f"(= {min_at_1to1:.0f}–{max_at_1to1:.0f} PPI bei 1:1)")
 
     if below_crit:
         return ("error", value,
-                f"{len(below_crit)} Bild(er) unter {crit_print:.0f} DPI (1:1). "
+                f"{len(below_crit)} Bild(er) unter {crit_print:.0f} PPI (1:1). "
                 f"Zu niedrig für Upscaling — bitte Originaldatei in höherer Auflösung liefern.")
     elif below_min:
         return ("warn", value,
-                f"{len(below_min)} Bild(er) unter {min_print:.0f} DPI (1:1). "
+                f"{len(below_min)} Bild(er) unter {min_print:.0f} PPI (1:1). "
                 f"Upscaling (2×) über 'Fix It' möglich.")
     else:
         return ("ok", value,
-                f"Alle Bilder erreichen mindestens {min_print:.0f} DPI bei 1:1. Auflösung ausreichend.")
+                f"Alle Bilder erreichen mindestens {min_print:.0f} PPI bei 1:1. Auflösung ausreichend.")
 
 
 # ─────────────────────────────────────────────
@@ -927,7 +927,7 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             if dpi_1to1 >= min_dpi_1to1:
                 continue  # bereits gut genug — kein Upscaling nötig
 
-            # Alle unter 50 DPI werden hochgerechnet (auch unter 25 DPI)
+            # Alle unter 50 PPI werden hochgerechnet (auch unter 25 PPI)
             # Report-Warnung macht auf kritisch schlechte Auflösung aufmerksam
             # Ziel: gerade über die 50 PPI-Schwelle (nicht pauschal 100 PPI)
             # Beispiel: Bild bei 40 PPI → Faktor 50/40 = 1.25x, nicht 2.5x
@@ -1029,7 +1029,7 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                         upscaled_count += 1
                         new_dpi = item["dpi_1to1"] * item["factor"]
                         print(f"[PPS] REPLACED '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
-                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} DPI@1:1", file=sys.stderr)
+                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} PPI@1:1", file=sys.stderr)
                         break
                 except Exception as xe:
                     print(f"[PPS] xobj error {name}: {xe}", file=sys.stderr)
@@ -1871,10 +1871,10 @@ def _generate_report_bytes(result_data, filename, job_name, print_w, print_h, sc
             dcls = "error" if dpi < 25 else ("warn" if dpi < 50 else "ok")
             dcol = sc.get(dcls, "#1a1a18")
             det_rows.append([
-                Paragraph(f'<font color="{dcol}"><b>{dpi:.1f} DPI</b></font>',
+                Paragraph(f'<font color="{dcol}"><b>{dpi:.1f} PPI</b></font>',
                           ps('di', fontSize=8)),
                 Paragraph(f'{img.get("width_px",img.get("width",0))}×{img.get("height_px",img.get("height",0))}px · '
-                          f'{img.get("colorspace","?")} · {dpi:.1f} DPI@1:1',
+                          f'{img.get("colorspace","?")} · {dpi:.1f} PPI@1:1',
                           ps('dn', fontSize=8, textColor=colors.HexColor('#9a9a94'))),
             ])
 
