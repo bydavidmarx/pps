@@ -74,8 +74,8 @@ async def analyze(
         _check_and_increment_trial(user_email.strip().lower())
 
     data = await file.read()
-    if len(data) > 100 * 1024 * 1024:
-        raise HTTPException(413, "Datei zu groß (max. 100 MB).")
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "Datei zu groß (max. 200 MB).")
 
     if user_email:
         _track_usage(user_email.strip().lower(), len(data))
@@ -126,8 +126,8 @@ async def fix_pdf(
 ):
     import gc, asyncio
     data = await file.read()
-    if len(data) > 100 * 1024 * 1024:
-        raise HTTPException(413, "Datei zu groß (max. 100 MB).")
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "Datei zu groß (max. 200 MB).")
 
     if user_email:
         _track_usage(user_email.strip().lower(), len(data))
@@ -180,6 +180,9 @@ async def fix_pdf(
     except asyncio.TimeoutError:
         _notify_error(f"Upscaling-Timeout: {file.filename}")
         # Weiter ohne Upscaling — besser als gar nichts
+    except Exception as _up_err:
+        print(f"[PPS] Upscaling error: {_up_err}", file=sys.stderr)
+        # Weiter ohne Upscaling
 
     # Schritt 4: Bleed + Cropmarks fixen (mit Timeout)
     try:
@@ -933,7 +936,11 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     if not to_upscale:
         return None, 0
 
-    import pikepdf
+    try:
+        import pikepdf
+    except ImportError:
+        print("[PPS] pikepdf not installed — upscaling not available", file=sys.stderr)
+        return None, 0
     import io as _io2
 
     upscaled_count = 0
@@ -1294,7 +1301,7 @@ def apply_fixes(doc, raw_bytes, print_w, print_h, scale, fix_cropmarks, fix_blee
         trimbox_w = new_w - 2 * B
         if abs(trimbox_w - expected_w_pt) > expected_w_pt * 0.02:
             import sys as _sys
-            print(f"[PPS] TrimBox-Korrektur: {trimbox_w*PT_TO_MM:.1f}mm → {expected_w_mm:.1f}mm",
+            print(f"[PPS] TrimBox-Korrektur: {trimbox_w*PT_TO_MM:.1f}mm → {expected_w_pt*PT_TO_MM:.1f}mm",
                   file=_sys.stderr)
             trim_rect = fitz.Rect(B, B, expected_w_pt + B, expected_h_pt + B)
         else:
