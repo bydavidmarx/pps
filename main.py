@@ -2291,18 +2291,37 @@ class IssueReport(BaseModel):
 
 @app.post("/report-issue")
 def report_issue(req: IssueReport):
-    """Empfaengt Fehlerberichte von Nutzern und schickt sie per E-Mail."""
+    """Empfaengt Fehlerberichte — sofort in Upstash, E-Mail im Hintergrund."""
+    import threading, json as _j2, time as _t2
+
+    # 1. Sofort in Upstash speichern (< 200ms) → schnelle Antwort
+    report_id = str(int(_t2.time() * 1000))
     try:
-        screenshot_html = ""
-        if req.screenshot and req.screenshot.startswith("data:image"):
-            screenshot_html = f'''
-            <div style="margin-top:1rem">
+        existing = _upstash_get("pps_reports") or "[]"
+        reports = _j2.loads(existing)
+        reports.insert(0, {
+            "id": report_id,
+            "user": req.user,
+            "page": req.page,
+            "message": req.message,
+            "timestamp": req.timestamp,
+            "status": "open",
+            "has_screenshot": bool(req.screenshot)
+        })
+        _upstash_set("pps_reports", _j2.dumps(reports[:100]))
+    except Exception as e:
+        print(f"[PPS] report upstash error: {e}", file=sys.stderr)
+
+    # 2. E-Mail im Hintergrund — blockiert den Request nicht
+    def _send_bg():
+        try:
+            screenshot_html = ""
+            if req.screenshot and req.screenshot.startswith("data:image"):
+                screenshot_html = f'''<div style="margin-top:1rem">
               <div style="font-size:10px;color:#9a9a94;margin-bottom:.5rem;font-family:monospace;text-transform:uppercase;letter-spacing:.1em">Screenshot</div>
               <img src="{req.screenshot}" style="width:100%;border:1px solid #d0cdc4;border-radius:3px" alt="Screenshot">
             </div>'''
-
-        html = f"""
-        <div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
+            html = f"""<div style="font-family:monospace;max-width:600px;padding:1.5rem;color:#1a1a18">
           <div style="background:#f5f3ee;border-left:3px solid #c0392b;padding:1rem;margin-bottom:1.5rem">
             <strong style="color:#c0392b">&#9888; Neuer Fehlerbericht</strong>
           </div>
@@ -2311,39 +2330,19 @@ def report_issue(req: IssueReport):
             <tr><td style="color:#9a9a94;padding:4px 8px">Seite</td><td style="padding:4px 8px">{req.page}</td></tr>
             <tr><td style="color:#9a9a94;padding:4px 8px">Zeitpunkt</td><td style="padding:4px 8px">{req.timestamp}</td></tr>
           </table>
-          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">
-            {req.message}
-          </div>
+          <div style="background:white;border:1px solid #d0cdc4;border-radius:3px;padding:1rem;font-size:14px;line-height:1.6">{req.message}</div>
           {screenshot_html}
-          <div style="margin-top:1.5rem;font-size:10px;color:#9a9a94">PPS XPRESS &mdash; Automatischer Fehlerbericht</div>
+          <div style="margin-top:1.5rem;font-size:10px;color:#9a9a94">PPS XPRESS — Automatischer Fehlerbericht · ID: {report_id}</div>
         </div>"""
+            _send_email(NOTIFY_EMAIL,
+                        f"PPS Fehlerbericht: {req.user} — {req.message[:60]}", html)
+        except Exception as e:
+            print(f"[PPS] report email error: {e}", file=sys.stderr)
 
-        _send_email(
-            NOTIFY_EMAIL,
-            f"PPS Fehlerbericht: {req.user} — {req.message[:60]}",
-            html
-        )
-        # Auch in Upstash speichern für Admin-Dashboard
-        try:
-            import json as _json2
-            existing = _upstash_get("pps_reports") or "[]"
-            reports = _json2.loads(existing)
-            reports.insert(0, {
-                "id": str(int(__import__('time').time() * 1000)),
-                "user": req.user,
-                "page": req.page,
-                "message": req.message,
-                "timestamp": req.timestamp,
-                "status": "open",
-                "has_screenshot": bool(req.screenshot)
-            })
-            _upstash_set("pps_reports", _json2.dumps(reports[:100]))
-        except Exception as _re:
-            print(f"[PPS] report upstash error: {_re}", file=sys.stderr)
-        return {"success": True}
-    except Exception as e:
-        print(f"[PPS] report-issue error: {e}", file=sys.stderr)
-        return {"success": False}
+    threading.Thread(target=_send_bg, daemon=True).start()
+
+    # 3. Sofort zurück — Frontend wartet nicht auf SMTP
+    return {"success": True, "id": report_id}
 
 # ─────────────────────────────────────────────
 #  HEALTH CHECK
