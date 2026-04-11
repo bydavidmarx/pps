@@ -2284,6 +2284,10 @@ class IssueReport(BaseModel):
     timestamp: str
     screenshot: Optional[str] = None
     backend: Optional[str] = None
+    store_in_dashboard: Optional[bool] = False  # Frontend-Flag, wird in Upstash gespeichert
+
+    class Config:
+        extra = 'ignore'  # Unbekannte Felder ignorieren statt 422 zu werfen
 
 @app.post("/report-issue")
 def report_issue(req: IssueReport):
@@ -2316,9 +2320,26 @@ def report_issue(req: IssueReport):
 
         _send_email(
             NOTIFY_EMAIL,
-            f"PPS Fehlerbericht: {req.user} &mdash; {req.message[:60]}",
+            f"PPS Fehlerbericht: {req.user} — {req.message[:60]}",
             html
         )
+        # Auch in Upstash speichern für Admin-Dashboard
+        try:
+            import json as _json2
+            existing = _upstash_get("pps_reports") or "[]"
+            reports = _json2.loads(existing)
+            reports.insert(0, {
+                "id": str(int(__import__('time').time() * 1000)),
+                "user": req.user,
+                "page": req.page,
+                "message": req.message,
+                "timestamp": req.timestamp,
+                "status": "open",
+                "has_screenshot": bool(req.screenshot)
+            })
+            _upstash_set("pps_reports", _json2.dumps(reports[:100]))
+        except Exception as _re:
+            print(f"[PPS] report upstash error: {_re}", file=sys.stderr)
         return {"success": True}
     except Exception as e:
         print(f"[PPS] report-issue error: {e}", file=sys.stderr)
