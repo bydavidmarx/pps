@@ -2348,6 +2348,50 @@ def report_issue(req: IssueReport):
 #  HEALTH CHECK
 # ─────────────────────────────────────────────
 
+
+@app.get("/admin/reports")
+def get_reports(admin_email: str, admin_password: str):
+    """Alle Fehlerberichte aus Upstash."""
+    if not _is_admin(admin_email, admin_password):
+        raise HTTPException(403, "Nicht autorisiert.")
+    try:
+        raw = _upstash_get("pps_reports") or "[]"
+        reports = json.loads(raw)
+        return {"reports": reports, "count": len(reports)}
+    except Exception as e:
+        return {"reports": [], "count": 0}
+
+@app.delete("/admin/reports/{report_id}")
+def delete_report(report_id: str, admin_email: str, admin_password: str):
+    """Einzelnen Bericht löschen."""
+    if not _is_admin(admin_email, admin_password):
+        raise HTTPException(403, "Nicht autorisiert.")
+    try:
+        raw = _upstash_get("pps_reports") or "[]"
+        reports = json.loads(raw)
+        reports = [r for r in reports if r.get("id") != report_id]
+        _upstash_set("pps_reports", json.dumps(reports))
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/admin/reports/{report_id}/status")
+def update_report_status(report_id: str, admin_email: str, admin_password: str, status: str = "resolved"):
+    """Status eines Berichts ändern (open/resolved)."""
+    if not _is_admin(admin_email, admin_password):
+        raise HTTPException(403, "Nicht autorisiert.")
+    try:
+        raw = _upstash_get("pps_reports") or "[]"
+        reports = json.loads(raw)
+        for r in reports:
+            if r.get("id") == report_id:
+                r["status"] = status
+                break
+        _upstash_set("pps_reports", json.dumps(reports))
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
 @app.get("/admin/config")
 def get_admin_config(admin_email: str, admin_password: str):
     """Returns safe admin configuration values (no passwords)."""
