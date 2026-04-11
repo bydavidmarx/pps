@@ -335,16 +335,18 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
     if trimbox:
         bleed_mm = ((media_w_mm - trim_w_mm) / 2 + (media_h_mm - trim_h_mm) / 2) / 2
     else:
-        excess_w = trim_w_mm - expected_w_mm
-        excess_h = trim_h_mm - expected_h_mm
-        tol = expected_bleed_mm * 0.50  # 50% Toleranz - fängt auch leicht abweichende Werte
-        if (excess_w > expected_bleed_mm * 1.2 and
-            abs((excess_w/2) - expected_bleed_mm) < tol and
-            abs((excess_h/2) - expected_bleed_mm) < tol):
-            bleed_mm = (excess_w/2 + excess_h/2) / 2
-            bleed_in_page = True
-        elif excess_w > expected_bleed_mm * 1.5:
-            bleed_mm = (excess_w/2 + excess_h/2) / 2
+        # Dieselbe geometrische Formel wie im Frontend (pps.html) — mathematisch robust.
+        # Bei unterschiedlichen Seitenmaßen (Normalfall) kürzt sich der Maßstab
+        # heraus: bleed = (pdfH·pw − pdfW·ph) / (2·(pw−ph)) gibt immer exakt
+        # die Beschnittzugabe zurück, unabhängig von Maßstab oder PDF-Punkt-Präzision.
+        if abs(print_w - print_h) > 1:
+            detected_bleed = (trim_h_mm * print_w - trim_w_mm * print_h) / (2 * (print_w - print_h))
+        else:
+            detected_bleed = (trim_w_mm - expected_w_mm) / 2
+
+        tol = expected_bleed_mm * 0.5
+        if 0 < detected_bleed <= 50 and abs(detected_bleed - expected_bleed_mm) < tol:
+            bleed_mm = detected_bleed
             bleed_in_page = True
         else:
             bleed_mm = 0.0
