@@ -335,18 +335,16 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
     if trimbox:
         bleed_mm = ((media_w_mm - trim_w_mm) / 2 + (media_h_mm - trim_h_mm) / 2) / 2
     else:
-        # Dieselbe geometrische Formel wie im Frontend (pps.html) — mathematisch robust.
-        # Bei unterschiedlichen Seitenmaßen (Normalfall) kürzt sich der Maßstab
-        # heraus: bleed = (pdfH·pw − pdfW·ph) / (2·(pw−ph)) gibt immer exakt
-        # die Beschnittzugabe zurück, unabhängig von Maßstab oder PDF-Punkt-Präzision.
-        if abs(print_w - print_h) > 1:
-            detected_bleed = (trim_h_mm * print_w - trim_w_mm * print_h) / (2 * (print_w - print_h))
-        else:
-            detected_bleed = (trim_w_mm - expected_w_mm) / 2
-
-        tol = expected_bleed_mm * 0.5
-        if 0 < detected_bleed <= 50 and abs(detected_bleed - expected_bleed_mm) < tol:
-            bleed_mm = detected_bleed
+        excess_w = trim_w_mm - expected_w_mm
+        excess_h = trim_h_mm - expected_h_mm
+        tol = expected_bleed_mm * 0.50  # 50% Toleranz - fängt auch leicht abweichende Werte
+        if (excess_w > expected_bleed_mm * 1.2 and
+            abs((excess_w/2) - expected_bleed_mm) < tol and
+            abs((excess_h/2) - expected_bleed_mm) < tol):
+            bleed_mm = (excess_w/2 + excess_h/2) / 2
+            bleed_in_page = True
+        elif excess_w > expected_bleed_mm * 1.5:
+            bleed_mm = (excess_w/2 + excess_h/2) / 2
             bleed_in_page = True
         else:
             bleed_mm = 0.0
@@ -1014,11 +1012,13 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                     print(f"[PPS]   xobj '{name}': {obj_w}x{obj_h}", file=sys.stderr)
                     if obj_w == item["w"] and obj_h == item["h"]:
                         cs = obj.get("/ColorSpace", pikepdf.Name("/DeviceRGB"))
-                        # Neuen Stream mit make_stream erstellen — korrekte pikepdf Methode
-                        # Nutze cs_name wenn Modus konvertiert wurde
                         final_cs = pikepdf.Name(cs_name) if 'cs_name' in dir() else cs
-                        new_stream = pdf_pk.make_stream(
-                            new_jpeg,
+
+                        # Für CMYK-Bilder: /Decode [1 0 1 0 1 0 1 0] übernehmen.
+                        # PIL liest CMYK-JPEGs in Adobe-Konvention (hoher Wert = viel Tinte).
+                        # PDF rendert ohne /Decode mit umgekehrter Konvention → Invertierung.
+                        # Das /Decode-Array stellt die korrekte Adobe-Konvention wieder her.
+                        stream_kwargs = dict(
                             Type=pikepdf.Name("/XObject"),
                             Subtype=pikepdf.Name("/Image"),
                             Width=new_w,
@@ -1027,6 +1027,10 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
                             BitsPerComponent=8,
                             Filter=pikepdf.Name("/DCTDecode"),
                         )
+                        if img.mode == 'CMYK':
+                            stream_kwargs["Decode"] = pikepdf.Array([1,0,1,0,1,0,1,0])
+
+                        new_stream = pdf_pk.make_stream(new_jpeg, **stream_kwargs)
                         xobjects[name] = pdf_pk.make_indirect(new_stream)
                         upscaled_count += 1
                         new_dpi = item["dpi_1to1"] * item["factor"]
