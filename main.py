@@ -957,6 +957,33 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     if not to_upscale:
         return None, 0
 
+    # ── Kachel-Erkennung: nebeneinanderliegende Bilder NICHT einzeln skalieren ──
+    # PDFs speichern große Bilder manchmal als Gitter von Kacheln (je ein xref).
+    # Einzelskalierung zerstört die Ausrichtung → falsch zusammengesetztes Bild.
+    def _is_adjacent(r1, r2, tol=3.0):
+        h_adj = abs(r1.x1-r2.x0) < tol or abs(r2.x1-r1.x0) < tol
+        y_ov  = r1.y0 < r2.y1 and r2.y0 < r1.y1
+        v_adj = abs(r1.y1-r2.y0) < tol or abs(r2.y1-r1.y0) < tol
+        x_ov  = r1.x0 < r2.x1 and r2.x0 < r1.x1
+        return (h_adj and y_ov) or (v_adj and x_ov)
+
+    all_rects = [(item["xref"], item["rect"]) for item in to_upscale]
+    tiled_xrefs = set()
+    for i, (xi, ri) in enumerate(all_rects):
+        for j, (xj, rj) in enumerate(all_rects):
+            if i != j and _is_adjacent(ri, rj):
+                tiled_xrefs.add(xi)
+                tiled_xrefs.add(xj)
+
+    if tiled_xrefs:
+        skipped = [t for t in to_upscale if t["xref"] in tiled_xrefs]
+        to_upscale = [t for t in to_upscale if t["xref"] not in tiled_xrefs]
+        print(f"[PPS] Kachel-Erkennung: {len(skipped)} Kachel-Bild(er) vom Upscaling ausgeschlossen",
+              file=sys.stderr)
+
+    if not to_upscale:
+        return None, 0
+
     try:
         import pikepdf
     except ImportError:
@@ -969,24 +996,29 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
     pdf_pk = pikepdf.open(_io2.BytesIO(pdf_bytes_orig))
     page_pk = pdf_pk.pages[0]
 
-    # Hole alle XObjects der Seite
+    # Alle XObjects der Seite mit ihrer Objektnummer indexieren.
+    # Wir matchen nach xref-Nummer (= pikepdf-Objektnummer), NICHT nach Dimensionen —
+    # bei Kacheln haben viele Tiles exakt gleiche Width/Height, Dimensions-Matching
+    # würde immer nur den ersten Treffer ersetzen → falsche Positionen.
     resources = page_pk.Resources
     xobjects = resources.get("/XObject", {})
+    xref_to_xobj_name = {}
+    for name in list(xobjects.keys()):
+        try:
+            obj_num = xobjects[name].objgen[0]  # pikepdf obj-Nummer = fitz xref
+            xref_to_xobj_name[obj_num] = name
+        except Exception:
+            pass
 
     for item in to_upscale:
         try:
             img = Image.open(_io.BytesIO(item["bytes"]))
-            original_mode = img.mode
 
             new_w = int(item["w"] * item["factor"])
             new_h = int(item["h"] * item["factor"])
 
-            # Modus beibehalten für JPEG-Kompatibilität
             if img.mode == 'L':
-                # Graustufen → als L hochrechnen, dann als JPEG speichern
-                img_up = img.resize((new_w, new_h), Image.LANCZOS)
-                # JPEG unterstützt kein L direkt → RGB konvertieren
-                img_up = img_up.convert('RGB')
+                img_up = img.resize((new_w, new_h), Image.LANCZOS).convert('RGB')
                 cs_name = "/DeviceRGB"
             elif img.mode == 'CMYK':
                 img_up = img.resize((new_w, new_h), Image.LANCZOS)
@@ -1002,47 +1034,35 @@ def upscale_images_in_pdf(doc, scale, min_dpi_1to1=50.0):
             img_up.save(out_buf, format="JPEG", quality=95)
             new_jpeg = out_buf.getvalue()
 
-            # Alle XObjects loggen zum Debuggen
-            print(f"[PPS] looking for image {item['w']}x{item['h']} in {len(list(xobjects.keys()))} xobjects", file=sys.stderr)
-            for name in list(xobjects.keys()):
-                try:
-                    obj = xobjects[name]
-                    obj_w = int(str(obj.get("/Width", "0")))
-                    obj_h = int(str(obj.get("/Height", "0")))
-                    print(f"[PPS]   xobj '{name}': {obj_w}x{obj_h}", file=sys.stderr)
-                    if obj_w == item["w"] and obj_h == item["h"]:
-                        cs = obj.get("/ColorSpace", pikepdf.Name("/DeviceRGB"))
-                        final_cs = pikepdf.Name(cs_name) if 'cs_name' in dir() else cs
+            # Exaktes Matching über xref-Nummer → immer das richtige XObject
+            xobj_name = xref_to_xobj_name.get(item["xref"])
+            if not xobj_name:
+                print(f"[PPS] xref {item['xref']} nicht in xobjects gefunden", file=sys.stderr)
+                continue
 
-                        # Für CMYK-Bilder: /Decode [1 0 1 0 1 0 1 0] übernehmen.
-                        # PIL liest CMYK-JPEGs in Adobe-Konvention (hoher Wert = viel Tinte).
-                        # PDF rendert ohne /Decode mit umgekehrter Konvention → Invertierung.
-                        # Das /Decode-Array stellt die korrekte Adobe-Konvention wieder her.
-                        stream_kwargs = dict(
-                            Type=pikepdf.Name("/XObject"),
-                            Subtype=pikepdf.Name("/Image"),
-                            Width=new_w,
-                            Height=new_h,
-                            ColorSpace=final_cs,
-                            BitsPerComponent=8,
-                            Filter=pikepdf.Name("/DCTDecode"),
-                        )
-                        if img.mode == 'CMYK':
-                            stream_kwargs["Decode"] = pikepdf.Array([1,0,1,0,1,0,1,0])
+            stream_kwargs = dict(
+                Type=pikepdf.Name("/XObject"),
+                Subtype=pikepdf.Name("/Image"),
+                Width=new_w,
+                Height=new_h,
+                ColorSpace=pikepdf.Name(cs_name),
+                BitsPerComponent=8,
+                Filter=pikepdf.Name("/DCTDecode"),
+            )
+            # CMYK: /Decode [1 0 1 0 1 0 1 0] für Adobe-Konvention
+            if img.mode == 'CMYK':
+                stream_kwargs["Decode"] = pikepdf.Array([1,0,1,0,1,0,1,0])
 
-                        new_stream = pdf_pk.make_stream(new_jpeg, **stream_kwargs)
-                        xobjects[name] = pdf_pk.make_indirect(new_stream)
-                        upscaled_count += 1
-                        new_dpi = item["dpi_1to1"] * item["factor"]
-                        print(f"[PPS] REPLACED '{name}': {item['w']}x{item['h']}→{new_w}x{new_h} "
-                              f"| {item['dpi_1to1']:.0f}→{new_dpi:.0f} PPI@1:1", file=sys.stderr)
-                        break
-                except Exception as xe:
-                    print(f"[PPS] xobj error {name}: {xe}", file=sys.stderr)
-                    continue
+            new_stream = pdf_pk.make_stream(new_jpeg, **stream_kwargs)
+            xobjects[xobj_name] = pdf_pk.make_indirect(new_stream)
+            upscaled_count += 1
+            print(f"[PPS] REPLACED xref={item['xref']} '{xobj_name}': "
+                  f"{item['w']}x{item['h']}→{new_w}x{new_h} "
+                  f"| {item['dpi_1to1']:.0f}→{item['dpi_1to1']*item['factor']:.0f} PPI@1:1",
+                  file=sys.stderr)
 
         except Exception as e:
-            print(f"[PPS] upscale item error: {e}", file=sys.stderr)
+            print(f"[PPS] upscale item error xref={item.get('xref')}: {e}", file=sys.stderr)
 
     out = _io2.BytesIO()
     pdf_pk.save(out)
