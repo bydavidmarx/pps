@@ -2335,6 +2335,9 @@ def report_issue(req: IssueReport):
             "has_screenshot": bool(req.screenshot)
         })
         _upstash_set("pps_reports", _j2.dumps(reports[:100]))
+        # Screenshot separat speichern (eigener Key, um pps_reports klein zu halten)
+        if req.screenshot:
+            _upstash_set(f"pps_screenshot_{report_id}", req.screenshot)
     except Exception as e:
         print(f"[PPS] report upstash error: {e}", file=sys.stderr)
 
@@ -2369,6 +2372,27 @@ def report_issue(req: IssueReport):
 
     # 3. Sofort zurück — Frontend wartet nicht auf SMTP
     return {"success": True, "id": report_id}
+
+@app.get("/admin/reports/{report_id}")
+def get_report(report_id: str, admin_email: str, admin_password: str):
+    """Einzelnen Bericht inkl. Screenshot abrufen."""
+    if not _is_admin(admin_email, admin_password):
+        raise HTTPException(403, "Nicht autorisiert.")
+    try:
+        raw = _upstash_get("pps_reports") or "[]"
+        reports = json.loads(raw)
+        report = next((r for r in reports if r.get("id") == report_id), None)
+        if not report:
+            raise HTTPException(404, "Bericht nicht gefunden.")
+        # Screenshot aus separatem Key laden
+        if report.get("has_screenshot"):
+            screenshot = _upstash_get(f"pps_screenshot_{report_id}")
+            report["screenshot"] = screenshot or None
+        return report
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 # ─────────────────────────────────────────────
 #  HEALTH CHECK
