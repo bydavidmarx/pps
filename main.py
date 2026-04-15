@@ -438,7 +438,7 @@ def run_analysis(doc, raw_bytes, print_w, print_h, scale, job_name, filename):
         "value": "Vorhanden — werden beim Fix entfernt" if has_cropmarks else "Keine vorhanden",
         "note": "Beschnittzeichen erkannt. Diese werden automatisch entfernt wenn du 'Fix It' für die Beschnittzugabe verwendest." if has_cropmarks
                 else "Keine Beschnittzeichen erkannt — korrekt.",
-        "fixable": False,
+        "fixable": has_cropmarks,  # Toggle anzeigen wenn erkannt
         "details": {"detected": has_cropmarks}
     })
 
@@ -855,13 +855,30 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
     trim_y1 = mediabox.y1 - (margin_h / PT_TO_MM)
 
     paths = page.get_drawings()
-    cropmark_count = 0
+    corner_hits = 0
+
+    # Eckrechtecke — Beschnittzeichen erscheinen NUR in den 4 Ecken
+    margin_x_pt = (margin_w / PT_TO_MM)
+    margin_y_pt = (margin_h / PT_TO_MM)
+    corner_size_x = max(margin_x_pt * 1.5, 10)
+    corner_size_y = max(margin_y_pt * 1.5, 10)
+    corners = [
+        fitz.Rect(mediabox.x0, mediabox.y0,
+                  mediabox.x0 + corner_size_x, mediabox.y0 + corner_size_y),
+        fitz.Rect(mediabox.x1 - corner_size_x, mediabox.y0,
+                  mediabox.x1, mediabox.y0 + corner_size_y),
+        fitz.Rect(mediabox.x0, mediabox.y1 - corner_size_y,
+                  mediabox.x0 + corner_size_x, mediabox.y1),
+        fitz.Rect(mediabox.x1 - corner_size_x, mediabox.y1 - corner_size_y,
+                  mediabox.x1, mediabox.y1),
+    ]
+    max_mark_len_pt = 15 / PT_TO_MM  # max 15mm
 
     for p in paths:
         r = p.get("rect")
         if r is None:
             continue
-        stroke_w = float(p.get("width") or 1.0)  # None-safe
+        stroke_w = float(p.get("width") or 1.0)
         rect_w_pt = abs(r.x1 - r.x0)
         rect_h_pt = abs(r.y1 - r.y0)
         rect_w_mm = rect_w_pt * PT_TO_MM
@@ -870,15 +887,21 @@ def detect_cropmarks(page, media_w, media_h, trim_w, trim_h):
             r.x1 < trim_x0 or r.x0 > trim_x1 or
             r.y1 < trim_y0 or r.y0 > trim_y1
         )
-        is_thin = stroke_w < 0.8
-        is_short = (rect_w_mm < 25 or rect_h_mm < 25)
-        is_line  = (rect_w_mm < 1.0 or rect_h_mm < 1.0)  # fast eindimensional
+        is_thin = stroke_w <= 2.0
+        is_short = rect_w_pt <= max_mark_len_pt and rect_h_pt <= max_mark_len_pt
 
-        if is_outside_trim and is_thin and (is_short or is_line):
-            cropmark_count += 1
+        if not (is_outside_trim and is_thin and is_short):
+            continue
 
-    # Mindestens 4 Beschnittzeichen-Kandidaten = wahrscheinlich vorhanden
-    return cropmark_count >= 4
+        # Muss in einer der 4 Ecken liegen
+        for corner in corners:
+            if (r.x0 >= corner.x0 - 2 and r.x1 <= corner.x1 + 2 and
+                r.y0 >= corner.y0 - 2 and r.y1 <= corner.y1 + 2):
+                corner_hits += 1
+                break
+
+    # Mindestens 2 Eck-Treffer
+    return corner_hits >= 2
 
 
 # ─────────────────────────────────────────────
